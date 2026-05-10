@@ -112,7 +112,27 @@
 ;; Data loading
 ;; ---------------------------------------------------------------------------
 
-(def min-bark-format "0.8.0")
+(def min-bark-format "0.9.0")
+
+(def ^:private related-kind-keys
+  "Per-kind relation fields emitted by bark 0.9.0. Each holds a vector of
+  `{:message-id ... :type ... :subject ... :archived-at ...}` entries."
+  [:related-to :resolves :resolved-by
+   :supersedes :superseded-by
+   :duplicates :duplicated-by])
+
+(defn- synthesize-related
+  "Aggregate per-kind relation fields into a single :related vector,
+  deduped by message-id, for the UI to read."
+  [report]
+  (let [merged (->> related-kind-keys
+                    (mapcat report)
+                    (filter :message-id)
+                    (group-by :message-id)
+                    vals
+                    (mapv first))]
+    (cond-> report
+      (seq merged) (assoc :related merged))))
 
 (defn- version-< [a b]
   (loop [as (str/split a #"\.")
@@ -173,26 +193,23 @@
 
 (defn- unwrap-envelope
   "Unwrap a reports.json envelope. Returns {:reports [...]}.
-  Injects :source and :base-url from envelope into each report.
-  Handles: new per-source format {source, reports, list-id, ...}
-  and legacy bare-array format."
+  Injects :source and :base-url from envelope into each report."
   [data]
-  (if (sequential? data)
-    {:reports data}
-    (let [fv (:bark-format data)]
-      (when (and fv (version-< fv min-bark-format))
-        (binding [*out* *err*]
-          (println (str "Warning: bark-format " fv
-                        " is older than minimum supported version "
-                        min-bark-format))))
-      (let [reports   (or (:reports data) [])
-            src-name  (:source data)
-            base-url (:base-url data)]
-        {:reports (mapv (fn [r]
-                          (cond-> r
-                            (and src-name (not (:source r))) (assoc :source src-name)
-                            base-url                         (assoc :base-url base-url)))
-                        reports)}))))
+  (let [fv (:bark-format data)]
+    (when (and fv (version-< fv min-bark-format))
+      (binding [*out* *err*]
+        (println (str "Warning: bark-format " fv
+                      " is older than minimum supported version "
+                      min-bark-format))))
+    (let [reports  (or (:reports data) [])
+          src-name (:source data)
+          base-url (:base-url data)]
+      {:reports (mapv (fn [r]
+                        (-> r
+                            (cond-> (and src-name (not (:source r))) (assoc :source src-name)
+                                    base-url                         (assoc :base-url base-url))
+                            synthesize-related))
+                      reports)})))
 
 (defn- inject-base-dir
   "Inject :base-dir into each report from a source path."
