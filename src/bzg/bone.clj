@@ -29,6 +29,7 @@
 ;;   -a, --add-source PATH    Add a reports.json source (URL or path)
 ;;   -r, --remove-source PATH Remove a reports.json source
 ;;   -l, --list-sources       List configured sources
+;;   -t, --test-config        Verify ~/.config/bone/config.edn
 ;;   -h, --help               Show help
 ;;   -                        Read JSON from stdin
 ;;
@@ -71,8 +72,11 @@
     (if (.exists f)
       (try
         (edn/read-string (slurp f))
-        (catch Exception _
-          (throw (ex-info (str "Config file is ill-formed: " config-path) {}))))
+        (catch Exception e
+          (throw (ex-info (str "Config file is ill-formed: " config-path
+                               "\n  " (.getMessage e)
+                               "\n  Run `bone -t` to check the config.")
+                          {}))))
       {})))
 
 (defn- load-sources
@@ -107,6 +111,145 @@
       (println "No sources configured. Use --add-source URL_OR_PATH to add one.")
       (doseq [{:keys [url repo]} sources]
         (println (str "  " url (when repo (str "  (repo: " repo ")"))))))))
+
+(def ^:private known-config-keys
+  #{:my-addresses :text-browser :diff-pager :sources :skip-columns :report})
+
+(def ^:private known-report-keys
+  #{:sections :stale-days :recent-days :expiry-days :top-n})
+
+(def ^:private valid-report-sections
+  #{"overview" "stale-patches" "stale-bugs" "active-threads" "expiring" "recent" "owned"})
+
+(defn- levenshtein [^String a ^String b]
+  (let [m (count a) n (count b)]
+    (cond
+      (zero? m) n
+      (zero? n) m
+      :else
+      (let [prev (int-array (inc n))
+            curr (int-array (inc n))]
+        (dotimes [j (inc n)] (aset prev j j))
+        (dotimes [i m]
+          (aset curr 0 (inc i))
+          (dotimes [j n]
+            (let [cost (if (= (.charAt a i) (.charAt b j)) 0 1)]
+              (aset curr (inc j)
+                    (min (inc (aget curr j))
+                         (inc (aget prev (inc j)))
+                         (+ (aget prev j) cost)))))
+          (System/arraycopy curr 0 prev 0 (inc n)))
+        (aget prev n)))))
+
+(defn- suggest-key
+  "Return the closest known key to k (within edit distance 3), or nil."
+  [k known]
+  (let [s (name k)]
+    (->> known
+         (map (fn [c] [c (levenshtein s (name c))]))
+         (filter (fn [[_ d]] (<= d 3)))
+         (sort-by second)
+         ffirst)))
+
+(defn- unknown-key-message [scope k known]
+  (let [base (str "Unknown key " (pr-str k) (when scope (str " in " scope)))]
+    (if-let [hint (suggest-key k known)]
+      (str base " (did you mean " (pr-str hint) "?)")
+      (str base " (ignored)"))))
+
+(defn- validate-config
+  "Validate a parsed config map. Returns [errors warnings]."
+  [config]
+  (let [errors   (volatile! [])
+        warnings (volatile! [])
+        err!     #(vswap! errors conj %)
+        warn!    #(vswap! warnings conj %)]
+    (if-not (map? config)
+      (err! "Top-level value must be a map")
+      (do
+        (doseq [k (keys config)]
+          (when-not (known-config-keys k)
+            (warn! (unknown-key-message nil k known-config-keys))))
+        (when-let [v (:my-addresses config)]
+          (when-not (or (string? v) (and (sequential? v) (every? string? v)))
+            (err! ":my-addresses must be a string or a vector of strings")))
+        (when-let [v (:text-browser config)]
+          (when-not (string? v)
+            (err! ":text-browser must be a string")))
+        (when-let [v (:diff-pager config)]
+          (when-not (string? v)
+            (err! ":diff-pager must be a string")))
+        (when-let [v (:skip-columns config)]
+          (when-not (and (sequential? v) (every? string? v))
+            (err! ":skip-columns must be a vector of strings")))
+        (when (contains? config :sources)
+          (let [v (:sources config)]
+            (if-not (sequential? v)
+              (err! ":sources must be a vector of maps")
+              (doseq [[i s] (map-indexed vector v)]
+                (cond
+                  (not (map? s))           (err! (str ":sources[" i "] must be a map"))
+                  (not (contains? s :url)) (err! (str ":sources[" i "] is missing :url"))
+                  (not (string? (:url s))) (err! (str ":sources[" i "] :url must be a string")))
+                (when (and (map? s) (contains? s :repo) (not (string? (:repo s))))
+                  (err! (str ":sources[" i "] :repo must be a string")))))))
+        (when (contains? config :report)
+          (let [r (:report config)]
+            (if-not (map? r)
+              (err! ":report must be a map")
+              (do
+                (doseq [k (keys r)]
+                  (when-not (known-report-keys k)
+                    (warn! (unknown-key-message ":report" k known-report-keys))))
+                (when (contains? r :sections)
+                  (let [ss (:sections r)]
+                    (if-not (sequential? ss)
+                      (err! ":report :sections must be a vector of strings")
+                      (doseq [name ss]
+                        (cond
+                          (not (string? name))
+                          (err! (str ":report :sections contains non-string: " (pr-str name)))
+                          (not (valid-report-sections name))
+                          (warn! (str ":report :sections contains unknown section "
+                                      (pr-str name)
+                                      " (valid: " (str/join ", " (sort valid-report-sections)) ")")))))))
+                (doseq [k [:stale-days :recent-days :expiry-days :top-n]]
+                  (when (contains? r k)
+                    (let [v (get r k)]
+                      (when-not (and (integer? v) (pos? v))
+                        (err! (str ":report " k " must be a positive integer"))))))))))))
+    [@errors @warnings]))
+
+(defn- test-config!
+  "Verify ~/.config/bone/config.edn. Returns true when valid (no errors)."
+  []
+  (println (str "Checking: " config-path))
+  (let [f (io/file config-path)]
+    (cond
+      (not (.exists f))
+      (do (println "Config file does not exist. bone will run with defaults.")
+          true)
+      :else
+      (let [parsed (try (edn/read-string (slurp f))
+                        (catch Exception e
+                          (println (str "  [error] cannot parse EDN: " (.getMessage e)))
+                          ::parse-failed))]
+        (if (= parsed ::parse-failed)
+          false
+          (let [[errors warnings] (validate-config parsed)]
+            (doseq [w warnings] (println (str "  [warn]  " w)))
+            (doseq [e errors]   (println (str "  [error] " e)))
+            (if (seq errors)
+              (do (println (str "Found " (count errors) " error(s)"
+                                (when (seq warnings)
+                                  (str ", " (count warnings) " warning(s)"))
+                                "."))
+                  false)
+              (do (println (str "Config is valid"
+                                (when (seq warnings)
+                                  (str " (" (count warnings) " warning(s))"))
+                                "."))
+                  true))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Data loading
@@ -1542,6 +1685,7 @@
    :list-sources  {:alias :l :coerce :boolean :desc "List configured sources"}
    :add-source    {:alias :a :coerce :string :desc "Add a source" :ref "<URL>"}
    :remove-source {:alias :r :coerce :string :desc "Remove a source" :ref "<URL>"}
+   :test-config   {:alias :t :coerce :boolean :desc "Verify ~/.config/bone/config.edn"}
    :help          {:alias :h :coerce :boolean :desc "Show this help"}})
 
 (defn- usage []
@@ -1643,15 +1787,16 @@
     nil)
   (try
     (let [args       (seq (or (seq args) *command-line-args*))
-          config     (load-config)
-          [cmd opts] (parse-opts args)]
+          [cmd opts] (parse-opts args)
+          config     (delay (load-config))]
       (cond
         (:help opts)           (usage)
+        (:test-config opts)    (when-not (test-config!) (System/exit 1))
         (= cmd "clear")        (clear-cache!)
         (= cmd "update")       (update-sources-cache!)
-        (= cmd "report")       (let [opts    (enrich-opts opts config)
+        (= cmd "report")       (let [opts    (enrich-opts opts @config)
                                       reports (filter-reports (:reports (load-data opts)) opts)
-                                      cfg     (cond-> config (:my-addresses opts) (assoc :my-addresses (:my-addresses opts)))]
+                                      cfg     (cond-> @config (:my-addresses opts) (assoc :my-addresses (:my-addresses opts)))]
                                   (generate-report cfg reports))
         (= cmd "todo")         (let [[out n] (write-todo-org! todo-org-path)]
                                   (println (str "Wrote " out " (" n " todo"
@@ -1659,7 +1804,7 @@
         (:list-sources opts)   (list-sources!)
         (:add-source opts)     (add-source! (:add-source opts))
         (:remove-source opts)  (remove-source! (:remove-source opts))
-        :else                  (let [opts      (enrich-opts opts config)
+        :else                  (let [opts      (enrich-opts opts @config)
                                       reports   (filter-reports (:reports (load-data opts)) opts)
                                       reload-fn (when (nil? (:data-src opts))
                                                   #(filter-reports (:reports (load-from-sources)) opts))
@@ -1667,7 +1812,7 @@
                                                       (:todo opts)   :todo
                                                       (:sticky opts) :sticky
                                                       :else          :default)]
-                                  (display-reports! config reports
+                                  (display-reports! @config reports
                                                     :reload-fn reload-fn
                                                     :skip-columns (:skip-columns opts)
                                                     :view-mode view-mode))))
