@@ -746,6 +746,17 @@
     (write-session! session-path
                     (assoc session :types nil :sources nil :topics nil))))
 
+(declare write-dispatch-script!)
+
+(defn- do-internal-rebuild-dispatch!
+  "Regenerate the dispatch script after `visible` changes (filter pickers,
+  mark toggles), so its line-indexed case statements match what fzf shows."
+  [dispatch-path help-path session-path]
+  (let [session (read-session session-path)
+        visible (session-visible session (load-state))
+        config  (load-config)]
+    (write-dispatch-script! dispatch-path help-path config visible)))
+
 ;; ---------------------------------------------------------------------------
 ;; Filtering
 ;; ---------------------------------------------------------------------------
@@ -1437,17 +1448,23 @@
         help-path     (tmp-path "help"     ts ".txt")
         bb-bone       (str "bb " (shell-escape bone-script-path) " ")
         sess          (shell-escape session-path)
+        print-list    (str bb-bone "--internal-print " sess)
+        rebuild       (str bb-bone "--internal-rebuild-dispatch "
+                           (shell-escape dispatch-path) " "
+                           (shell-escape help-path) " " sess)
+        ;; Refresh dispatch + list after a session mutation. Chained
+        ;; synchronously so the user can't press Enter mid-update.
+        refresh       (str "+execute-silent(" rebuild ")+reload-sync(" print-list ")")
         mark-bind     (fn [key action]
-                        (str key ":reload-sync(" bb-bone "--internal-print "
-                             sess " {n} " action ")"))
+                        (str key ":reload-sync(" print-list " {n} " action ")"
+                             "+execute-silent(" rebuild ")"))
         picker-bind   (fn [key sub]
                         ;; execute-silent keeps fzf from releasing its screen
                         ;; so the main list stays drawn while the tmux popup
                         ;; (or fallback inline picker) overlays it.
-                        (str key ":execute-silent(" bb-bone sub " " sess
-                             ")+reload-sync(" bb-bone "--internal-print " sess ")"))
+                        (str key ":execute-silent(" bb-bone sub " " sess ")" refresh))
         clear-bind    (str "ctrl-x:execute-silent(" bb-bone "--internal-clear-filters "
-                           sess ")+reload-sync(" bb-bone "--internal-print " sess ")")]
+                           sess ")" refresh)]
     (if (empty? reports)
       (println "No reports found.")
       (if (fzf-available?)
@@ -1784,6 +1801,9 @@
     (do (do-internal-pick-multi! (nth args 1) :topics) (System/exit 0))
     "--internal-clear-filters"
     (do (do-internal-clear-filters! (nth args 1)) (System/exit 0))
+    "--internal-rebuild-dispatch"
+    (do (do-internal-rebuild-dispatch! (nth args 1) (nth args 2) (nth args 3))
+        (System/exit 0))
     nil)
   (try
     (let [args       (seq (or (seq args) *command-line-args*))
