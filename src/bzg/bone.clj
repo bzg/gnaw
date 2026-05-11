@@ -1641,40 +1641,40 @@
     "--internal-clear-filters"
     (do (do-internal-clear-filters! (nth args 1)) (System/exit 0))
     nil)
-  (let [args       (seq (or (seq args) *command-line-args*))
-        config     (load-config)
-        [cmd opts] (parse-opts args)]
-    (cond
-      (:help opts)           (usage)
-      (= cmd "clear")        (clear-cache!)
-      (= cmd "update")       (update-sources-cache!)
-      (= cmd "report")       (let [opts    (enrich-opts opts config)
-                                    reports (filter-reports (:reports (load-data opts)) opts)
-                                    cfg     (cond-> config (:my-addresses opts) (assoc :my-addresses (:my-addresses opts)))]
-                                (generate-report cfg reports))
-      (= cmd "todo")         (let [[out n] (write-todo-org! todo-org-path)]
-                                (println (str "Wrote " out " (" n " todo"
-                                              (when (not= n 1) "s") ")")))
-      (:list-sources opts)   (list-sources!)
-      (:add-source opts)     (add-source! (:add-source opts))
-      (:remove-source opts)  (remove-source! (:remove-source opts))
-      :else                  (let [opts      (enrich-opts opts config)
-                                    reports   (filter-reports (:reports (load-data opts)) opts)
-                                    reload-fn (when (nil? (:data-src opts))
-                                                #(filter-reports (:reports (load-from-sources)) opts))
-                                    view-mode (cond (:all opts)    :all
-                                                    (:todo opts)   :todo
-                                                    (:sticky opts) :sticky
-                                                    :else          :default)]
-                                (display-reports! config reports
-                                                  :reload-fn reload-fn
-                                                  :skip-columns (:skip-columns opts)
-                                                  :view-mode view-mode)))))
-
-(when (= *file* (System/getProperty "babashka.file"))
   (try
-    (apply -main *command-line-args*)
+    (let [args       (seq (or (seq args) *command-line-args*))
+          config     (load-config)
+          [cmd opts] (parse-opts args)]
+      (cond
+        (:help opts)           (usage)
+        (= cmd "clear")        (clear-cache!)
+        (= cmd "update")       (update-sources-cache!)
+        (= cmd "report")       (let [opts    (enrich-opts opts config)
+                                      reports (filter-reports (:reports (load-data opts)) opts)
+                                      cfg     (cond-> config (:my-addresses opts) (assoc :my-addresses (:my-addresses opts)))]
+                                  (generate-report cfg reports))
+        (= cmd "todo")         (let [[out n] (write-todo-org! todo-org-path)]
+                                  (println (str "Wrote " out " (" n " todo"
+                                                (when (not= n 1) "s") ")")))
+        (:list-sources opts)   (list-sources!)
+        (:add-source opts)     (add-source! (:add-source opts))
+        (:remove-source opts)  (remove-source! (:remove-source opts))
+        :else                  (let [opts      (enrich-opts opts config)
+                                      reports   (filter-reports (:reports (load-data opts)) opts)
+                                      reload-fn (when (nil? (:data-src opts))
+                                                  #(filter-reports (:reports (load-from-sources)) opts))
+                                      view-mode (cond (:all opts)    :all
+                                                      (:todo opts)   :todo
+                                                      (:sticky opts) :sticky
+                                                      :else          :default)]
+                                  (display-reports! config reports
+                                                    :reload-fn reload-fn
+                                                    :skip-columns (:skip-columns opts)
+                                                    :view-mode view-mode))))
     (catch clojure.lang.ExceptionInfo e
       (binding [*out* *err*]
-        (println (.getMessage e)))
+        (println (str "bone: " (.getMessage e))))
       (System/exit 1))))
+
+(when (= *file* (System/getProperty "babashka.file"))
+  (apply -main *command-line-args*))
