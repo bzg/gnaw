@@ -843,7 +843,7 @@
 
 (defn- report-flags+score
   "Compute flags string and numeric score from report fields.
-  Flags: A=acked O=owned, third char: C=canceled R=resolved E=expired -=open.
+  Flags: A=acked O=owned, third char: C=canceled R=resolved E=expired S=superseded -=open.
   Score matches bark-index.clj: acked=1, owned=2, open=4 (closed=0)."
   [report]
   (let [a? (:acked report)
@@ -853,9 +853,10 @@
     {:flags (str (if a? "A" "-")
                  (if o? "O" "-")
                  (case cr
-                   "canceled" "C"
-                   "resolved" "R"
-                   "expired"  "E"
+                   "canceled"   "C"
+                   "resolved"   "R"
+                   "expired"    "E"
+                   "superseded" "S"
                    (if c? "R" "-")))
      :score (+ (if a? 1 0) (if o? 2 0) (if c? 0 4))}))
 
