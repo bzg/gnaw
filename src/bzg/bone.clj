@@ -821,6 +821,24 @@
   [s]
   (str/join (mapcat (fn [c] [c \u0336]) s)))
 
+(def ^:private ansi-italic-on  "\u001b[3m")
+(def ^:private ansi-italic-off "\u001b[23m")
+
+(defn- decorate-subject
+  "Mirror bark's web view conventions for closed reports:
+   - canceled / superseded → italic + Unicode strikethrough
+   - other closed (resolved, expired, …) → italic only
+   - open → plain.
+  Italic uses ANSI SGR 3, so fzf must be invoked with --ansi. Terminals
+  without italic support degrade silently to plain text."
+  [subject report]
+  (if (:closed report)
+    (let [cr (:close-reason report)
+          inner (cond-> subject
+                  (#{"canceled" "superseded"} cr) strikethrough)]
+      (str ansi-italic-on inner ansi-italic-off))
+    subject))
+
 (defn- days-until
   "Days from now to the report's date field (yyyy-mm-dd).
   Negative = past. Returns nil when field is absent."
@@ -899,8 +917,7 @@
                                        (when (:awaiting report)      "?")
                                        (when (seq (:related report)) "~"))])
      [(str (vote-cookie report)
-           (cond-> (:subject report "(no subject)")
-             (:closed report) strikethrough))])))
+           (decorate-subject (:subject report "(no subject)") report))])))
 
 (defn- report->row
   "Format a report as a tab-separated row for fzf display."
@@ -1380,7 +1397,7 @@
           (try
             (write-dispatch-script! dispatch-path help-path config resolved)
             (apply process/shell {:in input :out :string :continue true}
-                   ["fzf" "--header-lines" "1"
+                   ["fzf" "--ansi" "--header-lines" "1"
                     "--header" (str "~ " (count resolved) " related to: "
                                     (truncate (:subject selected-report "(no subject)") 60)
                                     " [Ctrl-x: back]")
@@ -1506,7 +1523,7 @@
                                   :input      (str/join "\n" aligned)
                                   :mid-index  mid-index}))
                   {:keys [user-state session visible aligned input mid-index]} ctx
-                  fzf-args   (cond-> ["fzf" "--header-lines" "1"
+                  fzf-args   (cond-> ["fzf" "--ansi" "--header-lines" "1"
                                       "--header" (status-header
                                                   (:sort-idx session 0) session
                                                   (:all-types session)
