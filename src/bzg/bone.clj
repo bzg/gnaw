@@ -25,7 +25,6 @@
 ;;   -n, --source NAME        Filter by source name
 ;;   -S, --skip-columns COLS  Columns to hide, comma-separated
 ;;   -m, --mine               Show only reports involving your address(es)
-;;   -c, --closed             Include closed reports
 ;;   -a, --add-source PATH    Add a reports.json source (URL or path)
 ;;   -r, --remove-source PATH Remove a reports.json source
 ;;   -l, --list-sources       List configured sources
@@ -679,6 +678,7 @@
         active-topics  (or topics (set all-topics))
         view           (or view-mode :default)]
     (->> reports
+         (remove :closed)
          (filter #(contains? active-types (display-type (:type %))))
          (filter #(or (empty? all-sources)
                       (contains? active-sources (:source %))))
@@ -815,6 +815,12 @@
     (str "[" v "] ")
     ""))
 
+(defn- strikethrough
+  "Overlay each character of s with U+0336 (combining long stroke overlay)
+  so it renders as struck-through text in any terminal — no ANSI needed."
+  [s]
+  (str/join (mapcat (fn [c] [c \u0336]) s)))
+
 (defn- days-until
   "Days from now to the report's date field (yyyy-mm-dd).
   Negative = past. Returns nil when field is absent."
@@ -892,7 +898,9 @@
                                        (when (seq (:texts report))   "#")
                                        (when (:awaiting report)      "?")
                                        (when (seq (:related report)) "~"))])
-     [(str (vote-cookie report) (:subject report "(no subject)"))])))
+     [(str (vote-cookie report)
+           (cond-> (:subject report "(no subject)")
+             (:closed report) strikethrough))])))
 
 (defn- report->row
   "Format a report as a tab-separated row for fzf display."
@@ -1390,45 +1398,24 @@
               (.delete (io/file help-path)))))))))
 
 
-(defn- handle-fzf-key
-  "Handle an fzf --expect key (only ctrl-u and ctrl-/). Mutates the session
-  file in place if needed; returns the cursor-pos to restore on next fzf
-  start, or nil to reset."
-  [key-used session-path
-   & {:keys [selected-report sel-idx config show-type? show-src? skip-columns
-             reload-fn]}]
-  (case key-used
-    "ctrl-/"
-    (do (when (and selected-report (seq (:related selected-report)))
-          (let [session (read-session session-path)
-                mid-index (into {} (keep (fn [r]
-                                           (when-let [mid (:message-id r)]
-                                             [mid r])))
-                                (:reports session))]
-            ;; Silent no-op when none of the related ids resolve in the loaded
-            ;; data: avoids a one-shot println that flashes between fzf alt-
-            ;; screens. Same when the report has no :related at all.
-            (show-related! selected-report mid-index config
-                           show-type? show-src? skip-columns (load-state))))
-        sel-idx)
-    "ctrl-u"
-    (do (if reload-fn
-          (do (println "  Updating cache...")
-              (update-sources-cache!)
-              (let [session     (read-session session-path)
-                    view        (or (:view-mode session) :default)
-                    filtered    (startup-filter (reload-fn) (load-state) view)]
-                (write-session! session-path
-                                (assoc session
-                                       :reports     (sort-reports filtered (:sort-idx session 0))
-                                       :all-types   (vec (distinct
-                                                          (map (comp display-type :type) filtered)))
-                                       :all-sources (vec (distinct (keep :source filtered)))
-                                       :all-topics  (vec (distinct (keep :topic filtered)))
-                                       :types nil :sources nil :topics nil))))
-          (println "  Cache update not available for this data source."))
-        nil)
-    nil))
+(defn- handle-ctrl-u!
+  "Refresh the source cache and update the on-disk session in place."
+  [reload-fn session-path]
+  (if reload-fn
+    (do (println "  Updating cache...")
+        (update-sources-cache!)
+        (let [session  (read-session session-path)
+              view     (or (:view-mode session) :default)
+              filtered (startup-filter (reload-fn) (load-state) view)]
+          (write-session! session-path
+                          (assoc session
+                                 :reports     (sort-reports filtered (:sort-idx session 0))
+                                 :all-types   (vec (distinct
+                                                    (map (comp display-type :type) filtered)))
+                                 :all-sources (vec (distinct (keep :source filtered)))
+                                 :all-topics  (vec (distinct (keep :topic filtered)))
+                                 :types nil :sources nil :topics nil))))
+    (println "  Cache update not available for this data source.")))
 
 (def ^:private bone-script-path
   (or (System/getProperty "babashka.file") *file*))
@@ -1488,63 +1475,93 @@
                              :show-src?    show-src?
                              :skip-columns skip-columns
                              :view-mode    view-mode}))
-          (loop [cursor-pos nil]
-            (let [user-state  (load-state)
-                  session     (read-session session-path)
-                  visible     (session-visible session user-state)
-                  aligned     (session-render session user-state)
-                  input       (str/join "\n" aligned)
-                  _           (write-dispatch-script! dispatch-path help-path config visible)
-                  fzf-args    (cond-> ["fzf" "--header-lines" "1"
-                                       "--header" (status-header
-                                                   (:sort-idx session 0) session
-                                                   (:all-types session)
-                                                   (:all-sources session)
-                                                   (:all-topics session))
-                                       "--no-sort" "--reverse" "--no-hscroll"
-                                       "--prompt" "report> "
-                                       "--expect" expect-keys
-                                       "--bind" (str "enter:" exec-action "(" dispatch-path " open {n})")
-                                       "--bind" (str "ctrl-o:execute-silent(" dispatch-path " browse {n})")
-                                       "--bind" (str "ctrl-v:" exec-action "(" dispatch-path " view {n})")
-                                       "--bind" (str "ctrl-h:" exec-action "(" dispatch-path " help)")
-                                       "--bind" "ctrl-n:down"
-                                       "--bind" "ctrl-p:up"
-                                       "--bind" (mark-bind "alt-!" "todo")
-                                       "--bind" (mark-bind "alt-*" "sticky")
-                                       "--bind" (mark-bind "alt-enter" "read")
-                                       "--bind" (picker-bind "ctrl-s" "--internal-pick-sort")
-                                       "--bind" (picker-bind "ctrl-r" "--internal-pick-types")
-                                       "--bind" (picker-bind "ctrl-b" "--internal-pick-sources")
-                                       "--bind" (picker-bind "ctrl-t" "--internal-pick-topics")
-                                       "--bind" clear-bind]
-                                cursor-pos (conj "--bind" (str "load:pos(" (inc cursor-pos) ")")))
+          ;; Cache `visible`, `aligned`, `mid-index`, and the on-disk dispatch
+          ;; script across loop iterations, keyed on the mtimes of the two
+          ;; mutable files: session.json (touched by sort/filter pickers) and
+          ;; state.edn (touched by mark toggles). Ctrl-/ touches neither, so
+          ;; coming back from the related view reuses everything.
+          (loop [cursor-pos nil
+                 cached     nil]
+            (let [mtimes     [(.lastModified (io/file session-path))
+                              (.lastModified (io/file state-edn-path))]
+                  ctx        (if (and cached (= mtimes (:mtimes cached)))
+                               cached
+                               (let [user-state (load-state)
+                                     session    (read-session session-path)
+                                     visible    (session-visible session user-state)
+                                     skip       (normalize-skip-columns (:skip-columns session))
+                                     header     (column-headers show-type? show-src? skip)
+                                     rows       (mapv #(report->row % show-type? show-src? skip user-state) visible)
+                                     aligned    (tabulate (cons header rows))
+                                     mid-index  (into {} (keep (fn [r]
+                                                                 (when-let [m (:message-id r)]
+                                                                   [m r])))
+                                                      (:reports session))]
+                                 (write-dispatch-script! dispatch-path help-path config visible)
+                                 {:mtimes     mtimes
+                                  :user-state user-state
+                                  :session    session
+                                  :visible    visible
+                                  :aligned    aligned
+                                  :input      (str/join "\n" aligned)
+                                  :mid-index  mid-index}))
+                  {:keys [user-state session visible aligned input mid-index]} ctx
+                  fzf-args   (cond-> ["fzf" "--header-lines" "1"
+                                      "--header" (status-header
+                                                  (:sort-idx session 0) session
+                                                  (:all-types session)
+                                                  (:all-sources session)
+                                                  (:all-topics session))
+                                      "--no-sort" "--reverse" "--no-hscroll"
+                                      "--prompt" "report> "
+                                      "--expect" expect-keys
+                                      "--bind" (str "enter:" exec-action "(" dispatch-path " open {n})")
+                                      "--bind" (str "ctrl-o:execute-silent(" dispatch-path " browse {n})")
+                                      "--bind" (str "ctrl-v:" exec-action "(" dispatch-path " view {n})")
+                                      "--bind" (str "ctrl-h:" exec-action "(" dispatch-path " help)")
+                                      "--bind" "ctrl-n:down"
+                                      "--bind" "ctrl-p:up"
+                                      "--bind" (mark-bind "alt-!" "todo")
+                                      "--bind" (mark-bind "alt-*" "sticky")
+                                      "--bind" (mark-bind "alt-enter" "read")
+                                      "--bind" (picker-bind "ctrl-s" "--internal-pick-sort")
+                                      "--bind" (picker-bind "ctrl-r" "--internal-pick-types")
+                                      "--bind" (picker-bind "ctrl-b" "--internal-pick-sources")
+                                      "--bind" (picker-bind "ctrl-t" "--internal-pick-topics")
+                                      "--bind" clear-bind]
+                               cursor-pos (conj "--bind" (str "load:pos(" (inc cursor-pos) ")")))
                   {:keys [exit out]}
                   (apply process/shell {:in input :out :string :continue true} fzf-args)
-                  lines    (when (seq (str/trim out))
-                             (str/split-lines (str/trim out)))
-                  key-used (first lines)
-                  selected (second lines)
-                  sel-idx  (when selected
-                             (some (fn [i] (when (= (nth aligned (inc i)) selected) i))
-                                   (range (count visible))))
+                  lines      (when (seq (str/trim out))
+                               (str/split-lines (str/trim out)))
+                  key-used   (first lines)
+                  selected   (second lines)
+                  sel-idx    (when selected
+                               (some (fn [i] (when (= (nth aligned (inc i)) selected) i))
+                                     (range (count visible))))
                   sel-report (when sel-idx (nth visible sel-idx))]
-              (when (loop-keys key-used)
-                (recur (handle-fzf-key key-used session-path
-                                       :selected-report sel-report
-                                       :sel-idx sel-idx
-                                       :config config
-                                       :show-type? show-type?
-                                       :show-src? show-src?
-                                       :skip-columns skip-columns
-                                       :reload-fn reload-fn)))))
+              (case key-used
+                "ctrl-/"
+                (do (when (and sel-report (seq (:related sel-report)))
+                      ;; Silent no-op when none of the related ids resolve in
+                      ;; the loaded data: avoids a one-shot println that
+                      ;; flashes between fzf alt-screens.
+                      (show-related! sel-report mid-index config
+                                     show-type? show-src? skip-columns user-state))
+                    (recur sel-idx ctx))
+                "ctrl-u"
+                (do (handle-ctrl-u! reload-fn session-path)
+                    (recur nil nil))
+                nil)))
           (finally
             (.delete (io/file dispatch-path))
             (.delete (io/file session-path))
             (.delete (io/file help-path))))
         ;; Plain text fallback
         (let [user-state (load-state)
-              visible    (filter #(visible-by-state? user-state % view-mode) reports)]
+              visible    (->> reports
+                              (remove :closed)
+                              (filter #(visible-by-state? user-state % view-mode)))]
           (println (count visible) "report(s):\n")
           (doseq [r visible]
             (println " " (report->line r show-type? show-src? skip-columns user-state))))))))
@@ -1695,7 +1712,6 @@
    :min-priority  {:alias :p :coerce :long   :desc "Filter by minimum priority (1-3)"}
    :min-score     {:alias :s :coerce :long   :desc "Filter by minimum score (0-7)"}
    :mine          {:alias :m :coerce :boolean :desc "Show only your reports"}
-   :closed        {:alias :c :coerce :boolean :desc "Include closed reports"}
    :skip-columns  {:alias :S :coerce :string :desc "Hide columns (comma-separated)" :ref "<COLS>"}
    :todo          {:alias :T :coerce :boolean :desc "Show only items marked :todo"}
    :sticky        {:alias :Y :coerce :boolean :desc "Show items marked :todo or :sticky"}
@@ -1765,14 +1781,15 @@
     (load-from-sources)))
 
 (defn- filter-reports
-  "Apply CLI filters to a reports vector."
-  [reports {:keys [source mine my-addresses min-priority min-score closed]}]
+  "Apply CLI filters to a reports vector. Closed reports are kept here so
+  the related-view can resolve cross-references; the main fzf list hides
+  them at render time via `session-visible`."
+  [reports {:keys [source mine my-addresses min-priority min-score]}]
   (cond->> reports
     source                     (filter #(= (:source %) source))
     (and mine my-addresses)    (filter #(involves-email? % my-addresses))
     min-priority               (filter #(>= (:priority % 0) min-priority))
-    min-score                  (filter #(>= (:score (report-flags+score %)) min-score))
-    (not closed)               (remove :closed)))
+    min-score                  (filter #(>= (:score (report-flags+score %)) min-score))))
 
 (defn- enrich-opts
   "Validate and enrich parsed CLI options with email from config."
