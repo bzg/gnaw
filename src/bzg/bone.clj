@@ -254,7 +254,7 @@
 ;; Data loading
 ;; ---------------------------------------------------------------------------
 
-(def min-bark-format "0.9.0")
+(def min-bark-format "0.9.1")
 
 (def ^:private related-kind-keys
   "Per-kind relation fields emitted by bark 0.9.0. Each holds a vector of
@@ -909,7 +909,7 @@
      (when-not (skip "flags")    [(:flags (report-flags+score report))])
      (when-not (skip "replies")  [(str (:replies report 0))])
      (when-not (skip "author")   [(truncate (:from report "?") 15)])
-     (when-not (skip "owner")    [(truncate (:owned report "") 15)])
+     (when-not (skip "owner")    [(truncate (:owned-name report "") 15)])
      (when-not (skip "date")     [(date-only (:date report))])
      (when-not (skip "att")      [(str (when (seq (:patches report)) "+")
                                        (when (seq (:events report))  "@")
