@@ -336,13 +336,14 @@
 (defn- unwrap-envelope
   "Unwrap a reports.json envelope. Returns {:reports [...]}.
   Injects :source and :base-url from envelope into each report."
-  [data]
+  [data & [src]]
   (let [fv (:bark-format data)]
     (when (and fv (version-< fv min-bark-format))
       (binding [*out* *err*]
         (println (str "Warning: bark-format " fv
                       " is older than minimum supported version "
-                      min-bark-format))))
+                      min-bark-format
+                      (when src (str " (source: " src ")"))))))
     (let [reports  (or (:reports data) [])
           src-name (:source data)
           base-url (:base-url data)]
@@ -370,10 +371,10 @@
 (defn- load-from-file [path]
   (when-not (.exists (io/file path))
     (throw (ex-info (str "File not found: " path) {:path path})))
-  (inject-base-dir (unwrap-envelope (load-json-string (slurp path))) path))
+  (inject-base-dir (unwrap-envelope (load-json-string (slurp path)) path) path))
 
 (defn- load-from-url [url]
-  (inject-base-url (unwrap-envelope (load-json-string (fetch-source-body url))) url))
+  (inject-base-url (unwrap-envelope (load-json-string (fetch-source-body url)) url) url))
 
 (defn- load-from-stdin []
   (unwrap-envelope (load-json-string (slurp *in*))))
@@ -427,7 +428,7 @@
                  (let [body (fetch-source-body src)]
                    (cache-write! src body)
                    (load-json-string body)))]
-    (-> (unwrap-envelope data)
+    (-> (unwrap-envelope data src)
         (inject-base-dir src)
         (inject-base-url src))))
 
