@@ -14,6 +14,7 @@
 ;;   bone.clj clear           Empty the cache
 ;;   bone.clj update          Fetch/update reports from all sources
 ;;   bone.clj report          Print a triage summary for maintainers
+;;   bone.clj prune           Drop state marks for reports no longer in any source
 ;;
 ;; Options:
 ;;   -f, --file FILE          Read reports from a JSON file
@@ -526,6 +527,53 @@
         (str "{"
              (str/join "\n " (map (fn [[k v]] (str (pr-str k) " " (pr-str v))) state))
              "}\n")))
+
+(defn- prune-state!
+  "Drop state entries whose message-id is not referenced by any cached report
+  from the currently configured sources. Refuses to run when a configured
+  source has no cache, since its message-ids would be unknown and valid
+  entries could be removed by mistake. When `dry-run?`, lists the orphans
+  but does not write."
+  [dry-run?]
+  (let [sources (load-sources)]
+    (when (empty? sources)
+      (throw (ex-info "Cannot prune: no sources configured (would erase every entry)." {})))
+    (let [missing (remove #(.exists (io/file (source->cache-file (:url %)))) sources)]
+      (when (seq missing)
+        (throw (ex-info (str "Cannot prune: cache missing for "
+                             (count missing) " source(s). Run `bone update` first.\n  "
+                             (str/join "\n  " (map :url missing)))
+                        {}))))
+    (let [state    (load-state)
+          live     (->> sources
+                        (mapcat (fn [{:keys [url]}]
+                                  (try (:reports (load-one-source-cached url))
+                                       (catch Exception e
+                                         (throw (ex-info (str "Cannot prune: failed to read cache for "
+                                                              url ": " (.getMessage e))
+                                                         {}))))))
+                        (keep :message-id)
+                        set)
+          orphans  (into {} (remove (fn [[mid _]] (live mid)) state))
+          kept     (apply dissoc state (keys orphans))
+          n-gone   (count orphans)
+          n-after  (count kept)
+          plural   (if (= 1 n-gone) "y" "ies")]
+      (cond
+        (zero? n-gone)
+        (println (str "Nothing to prune (" (count state) " entries kept)."))
+
+        dry-run?
+        (do (println (str "Would prune " n-gone " orphan entr" plural
+                          " (" n-after " would be kept):"))
+            (doseq [[mid v] (sort-by (fn [[_ v]] (or (:subject v) "")) orphans)]
+              (println (str "  " mid
+                            (when-let [s (:subject v)] (str "  " s))))))
+
+        :else
+        (do (save-state! kept)
+            (println (str "Pruned " n-gone " orphan entr" plural
+                          " (" n-after " kept).")))))))
 
 (defn- type->tag
   "Convert a report type ('patch', 'bug', ...) to ':patch:'. Returns nil for
@@ -1738,6 +1786,7 @@
    :add-source    {:alias :a :coerce :string :desc "Add a source" :ref "<URL>"}
    :remove-source {:alias :r :coerce :string :desc "Remove a source" :ref "<URL>"}
    :test-config   {:alias :t :coerce :boolean :desc "Verify ~/.config/bone/config.edn"}
+   :dry-run       {:coerce :boolean :desc "With `prune`: list orphan entries without removing them"}
    :help          {:alias :h :coerce :boolean :desc "Show this help"}})
 
 (defn- usage []
@@ -1748,6 +1797,7 @@
   (println "  clear           Clear the cache")
   (println "  report          Generate a triage summary")
   (println "  todo            Export marked items to ~/.config/bone/todo.org")
+  (println "  prune           Drop state marks for reports no longer in any source")
   (println)
   (println "Options:")
   (println (cli/format-opts {:spec cli-spec}))
@@ -1764,7 +1814,7 @@
   [args]
   (let [stdin?  (some #{"-"} args)
         args    (remove #{"-"} args)
-        subcmds #{"clear" "update" "report" "todo"}
+        subcmds #{"clear" "update" "report" "todo" "prune"}
         cmd     (first (filter subcmds args))
         args    (remove subcmds args)
         opts    (cli/parse-opts args {:spec cli-spec})
@@ -1857,6 +1907,7 @@
         (= cmd "todo")         (let [[out n] (write-todo-org! todo-org-path)]
                                   (println (str "Wrote " out " (" n " todo"
                                                 (when (not= n 1) "s") ")")))
+        (= cmd "prune")        (prune-state! (boolean (:dry-run opts)))
         (:list-sources opts)   (list-sources!)
         (:add-source opts)     (add-source! (:add-source opts))
         (:remove-source opts)  (remove-source! (:remove-source opts))
