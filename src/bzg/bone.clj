@@ -305,8 +305,12 @@
   For HTTP URLs, returns nil (use base-url instead)."
   [src]
   (when-not (url? src)
-    (when-let [parent (.getParent (io/file (strip-file-scheme src)))]
-      (str parent "/"))))
+    (let [abs-path (str (fs/absolutize (strip-file-scheme src)))]
+      (when-let [parent (.getParent (io/file abs-path))]
+        (let [dir (str parent "/")]
+          (if (str/ends-with? dir "/reports/")
+            (subs dir 0 (- (count dir) (count "reports/")))
+            dir))))))
 
 (defn- source-base-url
   "Derive a base URL from an HTTP source URL.  BARK serves the JSON from a
@@ -494,20 +498,54 @@
 
 (defn- iso-now [] (str (java.time.Instant/now)))
 
+(defn- parse-to-zdt
+  "Parse a date/time string of various formats to java.time.ZonedDateTime.
+  Supports RFC-1123/2822, ISO-8601, and simple YYYY-MM-DD formats.
+  Returns nil on failure."
+  [s]
+  (when (and s (not (str/blank? s)))
+    (let [s (str/trim s)]
+      (or
+       ;; 1. RFC 1123/2822 with or without comma
+       (try (java.time.ZonedDateTime/parse s java.time.format.DateTimeFormatter/RFC_1123_DATE_TIME)
+            (catch Exception _ nil))
+       (try (-> (java.time.OffsetDateTime/parse s (java.time.format.DateTimeFormatter/ofPattern "d MMM yyyy HH:mm:ss Z" java.util.Locale/US))
+                .toZonedDateTime)
+            (catch Exception _ nil))
+       (try (-> (java.time.OffsetDateTime/parse s (java.time.format.DateTimeFormatter/ofPattern "E, d MMM yyyy HH:mm:ss Z" java.util.Locale/US))
+                .toZonedDateTime)
+            (catch Exception _ nil))
+       ;; 2. Standard ISO-8601
+       (try (java.time.ZonedDateTime/parse s)
+            (catch Exception _ nil))
+       (try (-> (java.time.OffsetDateTime/parse s)
+                .toZonedDateTime)
+            (catch Exception _ nil))
+       ;; 3. ISO-8601 LocalDateTime
+       (try (-> (java.time.LocalDateTime/parse s)
+                (.atZone java.time.ZoneOffset/UTC))
+            (catch Exception _ nil))
+       ;; 4. Simple date time space-separated
+       (try (-> (java.time.LocalDateTime/parse s (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd HH:mm:ss"))
+                (.atZone java.time.ZoneOffset/UTC))
+            (catch Exception _ nil))
+       (try (-> (java.time.LocalDateTime/parse s (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd HH:mm"))
+                (.atZone java.time.ZoneOffset/UTC))
+            (catch Exception _ nil))
+       ;; 5. Local date only
+       (try (-> (java.time.LocalDate/parse s)
+                (.atStartOfDay java.time.ZoneOffset/UTC))
+            (catch Exception _ nil))))))
+
 (defn- format-org-timestamp
   "Format an ISO-8601 or 'YYYY-MM-DD HH:MM' string as an Org inactive
   timestamp '[YYYY-MM-DD Day HH:MM]'. Falls back to wrapping the raw value."
   [s]
   (if (or (nil? s) (str/blank? s)) ""
-      (or (try (let [inst (java.time.Instant/parse s)
-                     zdt  (.atZone inst (java.time.ZoneId/systemDefault))]
-                 (str "[" (.format zdt org-ts-fmt) "]"))
-               (catch Exception _ nil))
-          (try (let [ldt (java.time.LocalDateTime/parse
-                          s (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd HH:mm"))]
-                 (str "[" (.format ldt org-ts-fmt) "]"))
-               (catch Exception _ nil))
-          (str "[" s "]"))))
+      (if-let [zdt (parse-to-zdt s)]
+        (let [sys-zdt (.withZoneSameInstant zdt (java.time.ZoneId/systemDefault))]
+          (str "[" (.format sys-zdt org-ts-fmt) "]"))
+        (str "[" s "]"))))
 
 (defn- load-state []
   (let [f (io/file state-edn-path)]
@@ -839,14 +877,16 @@
   "Extract just the date portion, stripping any leading weekday and trailing time.
   Handles both 'Sat Mar 07 14:30' and '2026-03-07 14:30' style dates."
   [s]
-  (if (and s (seq s))
-    (let [s (str/trim s)
-          ;; Strip leading 'Mon ' / 'Tue ' etc.
-          s (str/replace-first s #"^[A-Z][a-z]{2}\s+" "")
-          ;; Strip time portion after date (either 'HH:MM...' or 'THH:MM...')
-          s (str/replace-first s #"[T ]?\d{2}:\d{2}.*" "")]
-      (str/trim s))
-    ""))
+  (if-let [zdt (parse-to-zdt s)]
+    (.format zdt (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd"))
+    (if (and s (seq s))
+      (let [s (str/trim s)
+            ;; Strip leading 'Mon ' / 'Tue ' etc.
+            s (str/replace-first s #"^[A-Za-z]{3,4},?\s+" "")
+            ;; Strip time portion after date
+            s (str/replace-first s #"[T ]?\d{2}:\d{2}.*" "")]
+        (str/trim s))
+      "")))
 
 (defn- parse-votes
   "Parse a votes string like \"3/5\" (sum/total) into [sum total].
@@ -893,11 +933,13 @@
   Negative = past. Returns nil when field is absent."
   [report field]
   (when-let [d (get report field)]
-    (try
-      (.between java.time.temporal.ChronoUnit/DAYS
-                (java.time.LocalDate/now)
-                (java.time.LocalDate/parse d))
-      (catch Exception _ nil))))
+    (if-let [zdt (parse-to-zdt d)]
+      (try
+        (.between java.time.temporal.ChronoUnit/DAYS
+                  (java.time.LocalDate/now)
+                  (.toLocalDate zdt))
+        (catch Exception _ nil))
+      nil)))
 
 (defn- deadline-col
   "Format the deadline column: days as string, or empty."
@@ -1105,16 +1147,11 @@
 (defn- parse-date-ms
   "Parse a date-raw string to epoch millis for sorting. Returns 0 on failure."
   [s]
-  (if (or (nil? s) (str/blank? s))
-    0
-    (or (try (.toEpochMilli (java.time.Instant/parse s))
-             (catch Exception _ nil))
-        (try (-> (java.time.LocalDate/parse s)
-                 (.atStartOfDay java.time.ZoneOffset/UTC)
-                 .toInstant
-                 .toEpochMilli)
-             (catch Exception _ nil))
-        0)))
+  (if-let [zdt (parse-to-zdt s)]
+    (try
+      (.toEpochMilli (.toInstant zdt))
+      (catch Exception _ 0))
+    0))
 
 (def sort-options
   ;; Each entry: [label key-fn cmp ?needs-state]. key-fn takes [report state],
