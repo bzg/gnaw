@@ -564,12 +564,13 @@
         (update :reports dedup-by-message-id))))
 
 ;; ---------------------------------------------------------------------------
-;; Local state (~/.config/bone/state.org)
+;; Local state (~/.config/bone/state.edn)
 ;;
 ;; Per-report `flag` (nil, :todo, :sticky, :done) and `read-at` (set when the
-;; user has visited the item). Persisted as Org so it can be opened in Emacs,
-;; hand-edited, or grepped. Keyed by RFC-2822 message-id, which is stable
-;; across re-fetches and globally unique.
+;; user has visited the item). Persisted as EDN, one entry per line so it
+;; stays hand-editable and greppable. Keyed by RFC-2822 message-id, which is
+;; stable across re-fetches and globally unique. (`bone todo` exports the
+;; :todo entries to a separate todo.org for Emacs.)
 ;; ---------------------------------------------------------------------------
 
 (def state-edn-path
@@ -1082,7 +1083,7 @@
 (defn- report-columns
   "Return a vector of column values for a report.
   skip is a set of column names to hide (e.g. #{\"owner\" \"att\"}).
-  user-state is the loaded state.org map; nil means no mark column."
+  user-state is the loaded state.edn map; nil means no mark column."
   [report show-type? show-src? skip user-state]
   (let [skip (normalize-skip-columns skip)]
     (concat
@@ -1249,7 +1250,7 @@
 
 (def sort-options
   ;; Each entry: [label key-fn cmp ?needs-state]. key-fn takes [report state],
-  ;; but only the entry tagged needs-state pays the cost of loading state.org.
+  ;; but only the entry tagged needs-state pays the cost of loading state.edn.
   [["date (newest)"    (fn [r _] (- (parse-date-ms (:date-raw r))))                              compare]
    ["date (oldest)"    (fn [r _] (parse-date-ms (:date-raw r)))                                  compare]
    ["priority (high)"  (fn [r _] (- (:priority r 0)))                                            compare]
@@ -1467,7 +1468,7 @@
     "  Ctrl-h                     Show this help"
     ""
     "Columns:"
-    "  !       Local mark: '!' = :todo, '*' = :sticky"
+    "  !       Local mark: '!' = :todo, '*' = :sticky, 'r' = :read"
     "  P       Priority: A = high, B = medium, C = low"
     "  D       Days until deadline (negative = past)"
     "  Flags   (A)cked (O)wned (C)anceled/(R)esolved/(E)xpired"
