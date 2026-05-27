@@ -23,10 +23,12 @@ Create =~/.config/bone/config.edn=:
 {:my-addresses ["you@example.com" "alias@example.com"]
  :text-browser "w3m"          ;; "w3m", "lynx" or "links"
  :diff-pager   "delta"        ;; "delta", "bat" or "diff-so-fancy"
- :sources      [{:url  "https://example.com/reports.json"
+ :sources      [{:urls ["https://example.com/reports/all.json"]
+                 :name "Example ML"
                  :repo "https://example.com/repo"}
-                {:url  "/path/to/reports.json"
-                 :repo "/path/to/repo"}]}
+                {:urls ["https://example.com/reports/all-open.json"
+                        "https://example.com/reports/all-closed.json"]
+                 :name "Another ML"}]}
 #+end_src
 
 - =:my-addresses= — your email address(es), used by =-m= to filter reports
@@ -37,9 +39,20 @@ Create =~/.config/bone/config.edn=:
 - =:diff-pager= — pager for viewing patches on =C-v=. When unset, bone
   probes for =delta=, =bat=, then falls back to =$PAGER= or =less=.
 - =:sources= — vector of report sources. Each source is a map with:
-  - =:url= — URL or local path to the BARK =reports.json=.
+  - =:urls= — a non-empty vector of URLs/paths to BARK =reports.json= files
+    whose reports are merged into one source (e.g. an =all-open.json= and an
+    =all-closed.json=).
+  - =:name= — the source's name. It is the *unique key* of a source: two
+    sources may not share a =:name=, and it overrides the =source= of every
+    report the source yields so the grouped files appear unified.
+    =--add-source= fills it in from the sibling =meta.json='s =source= field.
   - =:repo= — (optional) public URL or local path of the associated code
     repository.
+
+When adding an HTTP source, you may pass the full reports URL
+(=.../reports/all.json=), another report file (=.../reports/all-open.json=),
+or just the base URL (=https://tracker.orgmode.org=): bone resolves a bare
+base to =reports/all.json= and reads =reports/meta.json= to record =:name=.
 - =:skip-columns= — vector of column names to hide by default (e.g.
   =["priority" "score"]=).
 - =:report= — configuration for =bone report= (see [[*Triage report][Triage report]]).
@@ -99,6 +112,19 @@ The report can be configured in =config.edn= under the =:report= key:
 | =-l=, =--list-sources=              | List configured sources   |
 
 Sources are stored in =~/.config/bone/config.edn= under the =:sources= key.
+
+=--add-source= accepts either a direct =reports.json= URL/path, which is
+added as-is, or a tracker /base URL/ (e.g. =https://tracker.orgmode.org=).
+Given a base URL, bone reads =reports/meta.json= for the source name and the
+list of available report files, then lets you pick which to add (via fzf, or
+a numbered prompt when fzf is absent). The chosen files are grouped into one
+named source:
+
+#+begin_src clojure
+{:urls ["https://tracker.orgmode.org/reports/all-open.json"
+        "https://tracker.orgmode.org/reports/all-closed.json"]
+ :name "Org mode ML"}
+#+end_src
 
 ** Cache management
 

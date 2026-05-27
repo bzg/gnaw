@@ -26,7 +26,8 @@
 ;;   -n, --source NAME        Filter by source name
 ;;   -S, --skip-columns COLS  Columns to hide, comma-separated
 ;;   -m, --mine               Show only reports involving your address(es)
-;;   -a, --add-source PATH    Add a reports.json source (URL or path)
+;;   -a, --add-source PATH    Add a source; a tracker base URL prompts which
+;;                            report files to add (reads reports/meta.json)
 ;;   -r, --remove-source PATH Remove a reports.json source
 ;;   -l, --list-sources       List configured sources
 ;;   -t, --test-config        Verify ~/.config/bone/config.edn
@@ -80,37 +81,53 @@
       {})))
 
 (defn- load-sources
-  "Load :sources from config.edn — a vector of {:url ... :repo ...} maps."
+  "Load :sources from config.edn — a vector of {:urls [...] :name ... [:repo ...]}
+  maps. :name is the unique key identifying a source."
   []
   (vec (:sources (load-config))))
 
-(defn- save-sources! [sources]
-  (let [config  (load-config)
-        deduped (->> sources (reduce (fn [m s] (assoc m (:url s) s)) {}) vals vec)
-        updated (assoc config :sources deduped)]
+(defn- source-urls
+  "The report URLs of a source (its :urls vector)."
+  [s]
+  (vec (:urls s)))
+
+(defn- save-sources!
+  "Write sources to config.edn as-is (no silent de-dup; uniqueness of :name is
+  enforced by add-source! and reported by validate-config)."
+  [sources]
+  (let [config (load-config)]
     (.mkdirs (.getParentFile (io/file config-path)))
-    (spit config-path (pr-str updated))))
+    (spit config-path (pr-str (assoc config :sources (vec sources))))))
 
-(defn- add-source! [url]
-  (let [sources (load-sources)]
-    (if (some #(= (:url %) url) sources)
-      (println (str "Already registered: " url))
-      (do (save-sources! (conj sources {:url url}))
-          (println (str "Added: " url))))))
+;; `add-source!` is defined later (Source discovery), after the fzf pickers it
+;; relies on for interactive multi-file selection.
 
-(defn- remove-source! [url]
+(defn- remove-source!
+  "Remove URL from the sources. A source loses just that URL; it is dropped
+  when no URL remains."
+  [url]
   (let [sources (load-sources)]
-    (if (some #(= (:url %) url) sources)
-      (do (save-sources! (remove #(= (:url %) url) sources))
-          (println (str "Removed: " url)))
-      (println (str "Not found: " url)))))
+    (if-not (some #(contains? (set (source-urls %)) url) sources)
+      (println (str "Not found: " url))
+      (let [updated (keep (fn [s]
+                            (if-not (contains? (set (source-urls s)) url)
+                              s
+                              (let [remaining (vec (remove #{url} (source-urls s)))]
+                                (when (seq remaining)
+                                  (assoc s :urls remaining)))))
+                          sources)]
+        (save-sources! (vec updated))
+        (println (str "Removed: " url))))))
 
 (defn- list-sources! []
   (let [sources (load-sources)]
     (if (empty? sources)
       (println "No sources configured. Use --add-source URL_OR_PATH to add one.")
-      (doseq [{:keys [url repo]} sources]
-        (println (str "  " url (when repo (str "  (repo: " repo ")"))))))))
+      (doseq [{:keys [name repo] :as s} sources]
+        (println (str "  " (or name "(unnamed)")
+                      (when repo (str "  (repo: " repo ")"))))
+        (doseq [u (source-urls s)]
+          (println (str "      " u)))))))
 
 (def ^:private known-config-keys
   #{:my-addresses :text-browser :diff-pager :sources :skip-columns :report})
@@ -186,13 +203,28 @@
           (let [v (:sources config)]
             (if-not (sequential? v)
               (err! ":sources must be a vector of maps")
-              (doseq [[i s] (map-indexed vector v)]
-                (cond
-                  (not (map? s))           (err! (str ":sources[" i "] must be a map"))
-                  (not (contains? s :url)) (err! (str ":sources[" i "] is missing :url"))
-                  (not (string? (:url s))) (err! (str ":sources[" i "] :url must be a string")))
-                (when (and (map? s) (contains? s :repo) (not (string? (:repo s))))
-                  (err! (str ":sources[" i "] :repo must be a string")))))))
+              (do
+                (doseq [[i s] (map-indexed vector v)]
+                  (if-not (map? s)
+                    (err! (str ":sources[" i "] must be a map"))
+                    (do
+                      (cond
+                        (not (contains? s :urls))
+                        (err! (str ":sources[" i "] is missing :urls"))
+                        (not (and (sequential? (:urls s)) (seq (:urls s)) (every? string? (:urls s))))
+                        (err! (str ":sources[" i "] :urls must be a non-empty vector of strings")))
+                      (cond
+                        (not (contains? s :name))
+                        (err! (str ":sources[" i "] is missing :name"))
+                        (not (string? (:name s)))
+                        (err! (str ":sources[" i "] :name must be a string")))
+                      (when (and (contains? s :repo) (not (string? (:repo s))))
+                        (err! (str ":sources[" i "] :repo must be a string"))))))
+                ;; :name is the unique key identifying a source.
+                (doseq [[nm cnt] (->> v (filter map?) (keep :name) (filter string?) frequencies)
+                        :when (> cnt 1)]
+                  (err! (str ":sources has " cnt " sources named " (pr-str nm)
+                             " (:name must be unique)")))))))
         (when (contains? config :report)
           (let [r (:report config)]
             (if-not (map? r)
@@ -338,6 +370,49 @@
       (:body resp))
     (slurp (strip-file-scheme src))))
 
+(defn- resolve-source-url
+  "Normalize a user-supplied source URL to a concrete reports JSON file.
+  A URL already ending in .json is returned unchanged; a bare host or base
+  URL is resolved to its reports/all.json (BARK's default layout).
+  E.g. \"https://tracker.orgmode.org\"               => \".../reports/all.json\"
+       \"https://tracker.orgmode.org/reports\"       => \".../reports/all.json\"
+       \"https://tracker.orgmode.org/reports/x.json\" => unchanged"
+  [url]
+  (let [u (str/replace url #"/+$" "")]
+    (cond
+      (str/ends-with? u ".json")    url
+      (str/ends-with? u "/reports") (str u "/all.json")
+      :else                         (str u "/reports/all.json"))))
+
+(defn- meta-url-of
+  "meta.json sibling of a resolved reports URL (which ends in a .json file)."
+  [reports-url]
+  (str (subs reports-url 0 (inc (str/last-index-of reports-url "/"))) "meta.json"))
+
+(defn- valid-source-name
+  "A meta.json :source value usable as a source name, or nil."
+  [n]
+  (when (and (string? n) (not (str/blank? n))) n))
+
+(defn- fetch-source-name
+  "Fetch meta.json for a resolved reports URL and return its :source name
+  (e.g. \"Org mode ML\"), or nil when unreachable or absent."
+  [reports-url]
+  (try
+    (valid-source-name (:source (load-json-string (fetch-source-body (meta-url-of reports-url)))))
+    (catch Exception _ nil)))
+
+(defn- resolve-source
+  "Normalize a single *.json URL/path into a {:urls [resolved] [:name ...]} map.
+  HTTP base URLs are resolved to reports/all.json; the sibling meta.json is
+  read to fill in :name (BARK's :source). Sources are always stored under
+  :urls. :name is left absent when meta.json is unreachable; the caller
+  decides what to do (a source needs a unique :name)."
+  [input]
+  (let [resolved (if (url? input) (resolve-source-url input) input)
+        nm       (fetch-source-name resolved)]
+    (cond-> {:urls [resolved]} nm (assoc :name nm))))
+
 (defn- unwrap-envelope
   "Unwrap a reports.json envelope. Returns {:reports [...]}.
   Injects :source and :base-url from envelope into each report."
@@ -389,6 +464,18 @@
   [results]
   {:reports (into [] (mapcat :reports) results)})
 
+(defn- dedup-by-message-id
+  "Keep the first report for each :message-id, preserving order. Reports
+  without a :message-id are all kept (we cannot tell them apart)."
+  [reports]
+  (let [seen (volatile! #{})]
+    (filterv (fn [{:keys [message-id]}]
+               (or (nil? message-id)
+                   (when-not (@seen message-id)
+                     (vswap! seen conj message-id)
+                     true)))
+             reports)))
+
 (defn- load-from-urls-file [path]
   (when-not (.exists (io/file path))
     (throw (ex-info (str "URLs file not found: " path) {:path path})))
@@ -438,12 +525,12 @@
         (inject-base-url src))))
 
 (defn- update-sources-cache!
-  "Fetch all configured sources and update cache."
+  "Fetch every URL of every configured source and update the cache."
   []
   (let [sources (load-sources)]
     (when (empty? sources)
       (throw (ex-info "No sources configured." {})))
-    (doseq [{:keys [url]} sources]
+    (doseq [url (mapcat source-urls sources)]
       (try
         (cache-write! url (fetch-source-body url))
         (println (str "  Updated: " url))
@@ -452,7 +539,11 @@
             (println (str "  [warn] Failed to update " url ": " (.getMessage e)))))))))
 
 (defn- load-from-sources
-  "Load and merge reports from all configured sources."
+  "Load and merge reports from all configured sources. A source's :name
+  overrides the :source of every report it yields, so multiple JSON URLs
+  grouped under one source appear unified. Reports are de-duplicated by
+  :message-id (first occurrence wins), since a source may list overlapping
+  files (e.g. all.json alongside all-open.json)."
   []
   (let [sources (load-sources)]
     (when (empty? sources)
@@ -460,15 +551,17 @@
                            "Add a source:  bone --add-source URL_OR_PATH\n"
                            "Or use:        bone -f FILE | -u URL | -")
                       {})))
-    (merge-results
-     (keep (fn [{:keys [url]}]
-             (try
-               (load-one-source-cached url)
-               (catch Exception e
-                 (binding [*out* *err*]
-                   (println (str "  [warn] Failed to load " url ": " (.getMessage e))))
-                 nil)))
-           sources))))
+    (-> (merge-results
+         (for [s   sources
+               url (source-urls s)]
+           (try
+             (cond-> (load-one-source-cached url)
+               (:name s) (update :reports (fn [rs] (mapv #(assoc % :source (:name s)) rs))))
+             (catch Exception e
+               (binding [*out* *err*]
+                 (println (str "  [warn] Failed to load " url ": " (.getMessage e))))
+               {:reports []}))))
+        (update :reports dedup-by-message-id))))
 
 ;; ---------------------------------------------------------------------------
 ;; Local state (~/.config/bone/state.org)
@@ -573,18 +666,19 @@
   entries could be removed by mistake. When `dry-run?`, lists the orphans
   but does not write."
   [dry-run?]
-  (let [sources (load-sources)]
+  (let [sources  (load-sources)
+        all-urls (mapcat source-urls sources)]
     (when (empty? sources)
       (throw (ex-info "Cannot prune: no sources configured (would erase every entry)." {})))
-    (let [missing (remove #(.exists (io/file (source->cache-file (:url %)))) sources)]
+    (let [missing (remove #(.exists (io/file (source->cache-file %))) all-urls)]
       (when (seq missing)
         (throw (ex-info (str "Cannot prune: cache missing for "
-                             (count missing) " source(s). Run `bone update` first.\n  "
-                             (str/join "\n  " (map :url missing)))
+                             (count missing) " source URL(s). Run `bone update` first.\n  "
+                             (str/join "\n  " missing))
                         {}))))
     (let [state    (load-state)
-          live     (->> sources
-                        (mapcat (fn [{:keys [url]}]
+          live     (->> all-urls
+                        (mapcat (fn [url]
                                   (try (:reports (load-one-source-cached url))
                                        (catch Exception e
                                          (throw (ex-info (str "Cannot prune: failed to read cache for "
@@ -1227,6 +1321,123 @@
         (if (contains? selected "[all]")
           (set all)
           selected)))))
+
+;; ---------------------------------------------------------------------------
+;; Source discovery (`--add-source`)
+;;
+;; A direct *.json URL/path is added as-is. A bare/base URL is treated as a
+;; tracker: bone reads reports/meta.json for the source :name and its
+;; :reports-files (the JSON files that hold reports, as opposed to meta.json/
+;; votes.json/stats.json), then lets the user pick which to add. Trackers
+;; predating bark-format 0.9.3 lack :reports-files, so we fall back to
+;; scraping the directory listing.
+;; ---------------------------------------------------------------------------
+
+(def ^:private non-report-jsons
+  "JSON files served from reports/ that are not report collections."
+  #{"meta.json" "votes.json" "stats.json"})
+
+(defn- reports-dir-url
+  "Directory URL (with trailing /) holding the report JSON for a base/dir URL."
+  [url]
+  (let [resolved (resolve-source-url url)]
+    (subs resolved 0 (inc (str/last-index-of resolved "/")))))
+
+(defn- fetch-meta
+  "Fetch and parse reports/meta.json under a reports directory, or nil."
+  [reports-dir]
+  (try (load-json-string (fetch-source-body (str reports-dir "meta.json")))
+       (catch Exception _ nil)))
+
+(defn- scrape-report-jsons
+  "Fallback discovery: scrape *.json links from a reports/ directory listing,
+  dropping known non-report files. Returns a vector of basenames."
+  [reports-dir]
+  (try
+    (->> (re-seq #"href=\"([^\"]+\.json)\"" (fetch-source-body reports-dir))
+         (map (comp last #(str/split % #"/") second))
+         (remove non-report-jsons)
+         distinct vec)
+    (catch Exception _ [])))
+
+(defn- prompt-numbered-multi
+  "Plain-stdin fallback when fzf is absent: number the items, read a line of
+  comma/space-separated indices ('a' = all, empty = cancel). Returns a set."
+  [items]
+  (doseq [[i b] (map-indexed vector items)]
+    (println (format "  %2d  %s" (inc i) b)))
+  (print "Select files (numbers, 'a' for all, empty to cancel): ")
+  (flush)
+  (let [line (str/trim (or (read-line) ""))]
+    (cond
+      (str/blank? line) #{}
+      (= "a" line)      (set items)
+      :else (->> (str/split line #"[,\s]+")
+                 (keep #(some-> (parse-long %) dec))
+                 (keep #(get items %))
+                 set))))
+
+(defn- choose-report-files
+  "Let the user choose among report-file basenames, via fzf when available
+  else a numbered stdin prompt. Returns a (possibly empty) set of basenames."
+  [basenames]
+  (let [items (vec basenames)]
+    (if (fzf-available?)
+      (or (pick-multi! "add reports> " items) #{})
+      (prompt-numbered-multi items))))
+
+(defn- ensure-name-available!
+  "Throw when a source cannot be added: no :name could be determined, or a
+  source already carries that :name (:name is the unique key)."
+  [nm sources]
+  (when-not nm
+    (throw (ex-info (str "Could not determine the source :name from meta.json; "
+                         "cannot add. Ensure reports/meta.json is reachable.") {})))
+  (when (some #(= (:name %) nm) sources)
+    (throw (ex-info (str "A source named " (pr-str nm) " already exists.") {}))))
+
+(defn- add-source-direct!
+  "Add a single source from a *.json URL/path, taking :name from the sibling
+  meta.json."
+  [input]
+  (let [{:keys [name] :as src} (resolve-source input)
+        sources                (load-sources)]
+    (ensure-name-available! name sources)
+    (save-sources! (conj sources src))
+    (println (str "Added: " (first (source-urls src)) "  (name: " name ")"))))
+
+(defn- add-source-interactive!
+  "Discover the report files of a tracker base URL and let the user pick which
+  to add as a single grouped source."
+  [input]
+  (let [reports-dir (reports-dir-url input)
+        meta        (fetch-meta reports-dir)
+        nm          (valid-source-name (:source meta))
+        sources     (load-sources)
+        basenames   (or (seq (:reports-files meta))
+                        (seq (scrape-report-jsons reports-dir)))]
+    (ensure-name-available! nm sources)
+    (when-not basenames
+      (throw (ex-info (str "No report files found at " reports-dir
+                           "\n  (could not read meta.json or list the directory).") {})))
+    (let [chosen (choose-report-files basenames)]
+      (if (empty? chosen)
+        (println "Nothing selected; no source added.")
+        (let [urls (mapv #(str reports-dir %) (filter chosen basenames))]
+          (save-sources! (conj sources {:urls urls :name nm}))
+          (println (str "Added " (count urls) " file"
+                        (when (not= 1 (count urls)) "s")
+                        " as \"" nm "\":"))
+          (doseq [u urls] (println (str "  " u))))))))
+
+(defn- add-source!
+  "Add a source. A direct *.json URL/path is added as-is; any other HTTP URL
+  is treated as a tracker base and triggers interactive file selection."
+  [input]
+  (if (and (url? input)
+           (not (str/ends-with? (str/replace input #"/+$" "") ".json")))
+    (add-source-interactive! input)
+    (add-source-direct! input)))
 
 ;; ---------------------------------------------------------------------------
 ;; Dispatch script for fzf execute bindings
