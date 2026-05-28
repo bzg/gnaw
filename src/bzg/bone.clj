@@ -566,11 +566,11 @@
 ;; ---------------------------------------------------------------------------
 ;; Local state (~/.config/bone/state.edn)
 ;;
-;; Per-report `flag` (nil, :todo, :sticky, :done) and `read-at` (set when the
-;; user has visited the item). Persisted as EDN, one entry per line so it
+;; Per-report `flag` (nil or :sticky) and `skip-since` (set when the user skips an
+;; item to hide it).  Persisted as EDN, one entry per line so it
 ;; stays hand-editable and greppable. Keyed by RFC-2822 message-id, which is
 ;; stable across re-fetches and globally unique. (`bone todo` exports the
-;; :todo entries to a separate todo.org for Emacs.)
+;; :sticky entries to a separate todo.org for Emacs.)
 ;; ---------------------------------------------------------------------------
 
 (def state-edn-path
@@ -581,10 +581,10 @@
   (str (System/getProperty "user.home") "/.config/bone/todo.org"))
 
 (def ^:private org-header
-  "#+TITLE: bone state\n#+TODO: TODO STICKY | DONE\n\n")
+  "#+TITLE: bone state\n#+TODO: TODO | DONE\n\n")
 
 (def ^:private flag->keyword
-  {:todo "TODO" :sticky "STICKY" :done "DONE"})
+  {:sticky "TODO" :done "DONE"})
 
 (def ^:private org-ts-fmt
   (java.time.format.DateTimeFormatter/ofPattern
@@ -715,7 +715,7 @@
   (when (and t (re-matches #"[a-zA-Z][\w-]*" (str t)))
     (str ":" (str/lower-case t) ":")))
 
-(defn- render-entry [mid {:keys [flag read-at author subject type created]}]
+(defn- render-entry [mid {:keys [flag skip-since author subject type created]}]
   (let [kw (flag->keyword flag)
         tag (type->tag type)]
     (str "* " (when kw (str kw " ")) (or subject "(no subject)")
@@ -726,8 +726,8 @@
            (str "  :CREATED:    " (format-org-timestamp created) "\n"))
          (when author
            (str "  :AUTHOR:     " author "\n"))
-         (when read-at
-           (str "  :READ-AT:    " (format-org-timestamp read-at) "\n"))
+         (when skip-since
+           (str "  :SKIP-SINCE: " (format-org-timestamp skip-since) "\n"))
          "  :END:\n")))
 
 (defn- render-org-state [state]
@@ -737,9 +737,9 @@
 
 (defn- write-todo-org!
   "Generate todo.org from the current state.edn, restricted to entries flagged
-  :todo. :sticky and :read entries are skipped. Returns [path n-todos]."
+  :sticky. Skipped entries are excluded. Returns [path n-todos]."
   [out-path]
-  (let [todos (into {} (filter (fn [[_ v]] (= :todo (:flag v))) (load-state)))]
+  (let [todos (into {} (filter (fn [[_ v]] (= :sticky (:flag v))) (load-state)))]
     (.mkdirs (.getParentFile (io/file out-path)))
     (spit out-path (render-org-state todos))
     [out-path (count todos)]))
@@ -763,59 +763,52 @@
     (:date report)         (assoc :created (:date report))))
 
 (defn- apply-transition
-  "Apply an action ∈ #{:read :todo :sticky} to the state. All three actions
-  toggle off when the corresponding state is already set. Entries that end up
-  with neither :flag nor :read-at are dissoc'd."
+  "Apply an action ∈ #{:sticky :skip} to the state. The two marks are mutually
+  exclusive (:sticky clears a skip, :skip clears a flag); re-applying toggles
+  off. :skip is stored as :skip-since. Entries that end up with neither :flag nor
+  :skip-since are dissoc'd."
   [state action mid report]
   (if (nil? mid)
     state
     (let [base      (enrich-entry (or (get state mid) {}) report)
           new-entry (case action
-                      :read   (if (:read-at base)
-                                (dissoc base :read-at)
-                                (assoc base :read-at (iso-now)))
-                      :todo   (if (= (:flag base) :todo)
-                                (dissoc base :flag)
-                                (assoc base :flag :todo))
                       :sticky (if (= (:flag base) :sticky)
                                 (dissoc base :flag)
-                                (assoc base :flag :sticky)))]
-      (if (and (nil? (:flag new-entry)) (nil? (:read-at new-entry)))
+                                (-> base (dissoc :skip-since) (assoc :flag :sticky)))
+                      :skip (if (:skip-since base)
+                              (dissoc base :skip-since)
+                              (-> base (dissoc :flag) (assoc :skip-since (iso-now)))))]
+      (if (and (nil? (:flag new-entry)) (nil? (:skip-since new-entry)))
         (dissoc state mid)
         (assoc state mid new-entry)))))
 
 (defn- visible-by-state?
   "Show a report given the local state and the active view mode.
-   :default and :all → everything (the :read items are dropped upstream by
-   `startup-filter` for :default; once the session is loaded, marking an
-   item :read keeps it visible until the next reload).
-   :todo   → only :todo.
-   :sticky → :todo and :sticky."
+   :default and :all → everything (skipped items are dropped upstream by
+   `startup-filter` for :default; once the session is loaded, skipping an
+   item keeps it visible until the next reload).
+   :sticky → only :sticky."
   [state report view]
-  (let [flag (:flag (get state (:message-id report)))]
-    (case view
-      :todo   (= flag :todo)
-      :sticky (#{:todo :sticky} flag)
-      true)))
+  (case view
+    :sticky (= (:flag (get state (:message-id report))) :sticky)
+    true))
 
 (defn- mark-prefix
-  "Single-character prefix for the leftmost column.
-  Flag wins over read-at: a :todo+read item shows '!', not 'r'."
+  "Single-character prefix for the leftmost column: '*' sticky, '_' skipped."
   [state mid]
   (let [s (get state mid)]
-    (case (:flag s)
-      :todo   "!"
-      :sticky "*"
-      (if (:read-at s) "r" " "))))
+    (cond (= (:flag s) :sticky) "*"
+          (:skip-since s)          "_"
+          :else                 " ")))
 
 (defn- startup-filter
-  "Apply the :default-mode startup filter: drop reports the user has marked
-  :read with no active flag. Other view modes pass through unchanged."
+  "Apply the :default-mode startup filter: drop reports the user has skipped
+  (skip-since set, no active flag). Other view modes pass through unchanged."
   [reports user-state view-mode]
   (if (= view-mode :default)
     (remove (fn [r]
               (let [s (get user-state (:message-id r))]
-                (and (:read-at s) (nil? (:flag s)))))
+                (and (:skip-since s) (nil? (:flag s)))))
             reports)
     reports))
 
@@ -1265,10 +1258,10 @@
    ["awaiting (recent)" (fn [r _] (if (:awaiting r) (- (parse-date-ms (:date-raw r))) Long/MAX_VALUE)) compare]
    ["awaiting (oldest)" (fn [r _] (if (:awaiting r) (parse-date-ms (:date-raw r)) Long/MAX_VALUE))    compare]
    ["type"              (fn [r _] (display-type (:type r "")))                                   compare]
-   ["marked (todo, sticky first)"
+   ["marked (sticky first)"
     (fn [r state]
       (let [flag (:flag (get state (:message-id r)))
-            group (case flag :todo 0 :sticky 1 2)]
+            group (if (= flag :sticky) 0 1)]
         [group (- (parse-date-ms (:date-raw r)))]))
     compare :needs-state]])
 
@@ -1462,13 +1455,12 @@
     "  Ctrl-b / Ctrl-r / Ctrl-t   Filter by source / type / topic"
     "  Ctrl-x                     Remove all filters"
     "  Ctrl-u                     Update cache and reload"
-    "  Alt-!                      Toggle :todo (column shows '!')"
-    "  Alt-*                      Toggle :sticky (column shows '*')"
-    "  Alt-Enter                  Toggle :read (column shows 'r'; hidden at next launch unless --all)"
+    "  Alt-*                      Toggle :sticky (keep visible, column '*')"
+    "  Alt-Enter                  Toggle :skip (hide; column '_', shown only with --all)"
     "  Ctrl-h                     Show this help"
     ""
     "Columns:"
-    "  !       Local mark: '!' = :todo, '*' = :sticky, 'r' = :read"
+    "  !       Local mark: '*' = :sticky, '_' = :skip"
     "  P       Priority: A = high, B = medium, C = low"
     "  D       Days until deadline (negative = past)"
     "  Flags   (A)cked (O)wned (C)anceled/(R)esolved/(E)xpired"
@@ -1739,7 +1731,7 @@
   "Display reports interactively with fzf, or as plain text lines.
   reload-fn, when non-nil, is called on ctrl-u to refresh the cache and
   return a new {:reports ...} map.
-  view-mode ∈ #{:default :todo :sticky :all} controls state-based visibility."
+  view-mode ∈ #{:default :sticky :all} controls state-based visibility."
   [config reports & {:keys [reload-fn skip-columns view-mode]}]
   (let [show-type?   true
         show-src?    (multiple-sources? reports)
@@ -1836,9 +1828,8 @@
                                       "--bind" (str "ctrl-h:" exec-action "(" dispatch-path " help)")
                                       "--bind" "ctrl-n:down"
                                       "--bind" "ctrl-p:up"
-                                      "--bind" (mark-bind "alt-!" "todo")
                                       "--bind" (mark-bind "alt-*" "sticky")
-                                      "--bind" (mark-bind "alt-enter" "read")
+                                      "--bind" (mark-bind "alt-enter" "skip")
                                       "--bind" (picker-bind "ctrl-s" "--internal-pick-sort")
                                       "--bind" (picker-bind "ctrl-r" "--internal-pick-types")
                                       "--bind" (picker-bind "ctrl-b" "--internal-pick-sources")
@@ -2028,9 +2019,8 @@
    :min-score     {:alias :s :coerce :long   :desc "Filter by minimum score (0-7)"}
    :mine          {:alias :m :coerce :boolean :desc "Show only your reports"}
    :skip-columns  {:alias :S :coerce :string :desc "Hide columns (comma-separated)" :ref "<COLS>"}
-   :todo          {:alias :T :coerce :boolean :desc "Show only items marked :todo"}
-   :sticky        {:alias :Y :coerce :boolean :desc "Show items marked :todo or :sticky"}
-   :all           {:alias :A :coerce :boolean :desc "Show all items, including :read"}
+   :sticky        {:alias :T :coerce :boolean :desc "Show only items marked :sticky"}
+   :all           {:alias :A :coerce :boolean :desc "Show all items, including skipped"}
    :list-sources  {:alias :l :coerce :boolean :desc "List configured sources"}
    :add-source    {:alias :a :coerce :string :desc "Add a source" :ref "<URL>"}
    :remove-source {:alias :r :coerce :string :desc "Remove a source" :ref "<URL>"}
@@ -2053,9 +2043,8 @@
   (println "  -               Read reports from stdin")
   (println)
   (println "Local marks (kept in ~/.config/bone/state.edn):")
-  (println "  Alt-!  toggle :todo   (column '!')")
-  (println "  Alt-*  toggle :sticky (column '*')")
-  (println "  Alt-Enter toggle :read (column 'r'; hidden at next launch unless --all)")
+  (println "  Alt-*  toggle :sticky (keep visible, column '*')")
+  (println "  Alt-Enter toggle :skip (hide; column '_', shown only with --all)")
   (println "  Ctrl-h inside fzf shows the full keymap."))
 
 (defn- parse-opts
@@ -2164,10 +2153,9 @@
                                       reports   (filter-reports (:reports (load-data opts)) opts)
                                       reload-fn (when (nil? (:data-src opts))
                                                   #(filter-reports (:reports (load-from-sources)) opts))
-                                      view-mode (cond (:all opts)    :all
-                                                      (:todo opts)   :todo
+                                      view-mode (cond (:all opts)  :all
                                                       (:sticky opts) :sticky
-                                                      :else          :default)]
+                                                      :else        :default)]
                                   (display-reports! @config reports
                                                     :reload-fn reload-fn
                                                     :skip-columns (:skip-columns opts)
