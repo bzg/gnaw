@@ -1,23 +1,23 @@
-#+title: bone — BARK's Own Nifty Explorer
+#+title: gnaw — GNAW is Not Another Workflow
 #+author: Bastien Guerry
 
 [[https://intver.org/][https://img.shields.io/badge/versioning-intver.org-blue.svg?style=for-the-badge]]
 
-*bone* (what you get when you stop barking) is a standalone [[https://github.com/babashka/babashka][Babashka]]
-script for browsing [[https://codeberg.org/bzg/bark][BARK]] reports. When [[https://github.com/junegunn/fzf][fzf]] is available, bone lets you
-browse BARK reports interactively.
+*gnaw* (what you do to a bone) is a standalone [[https://github.com/babashka/babashka][Babashka]]
+script for browsing [[https://codeberg.org/bzg/bone][BONE]] reports. When [[https://github.com/junegunn/fzf][fzf]] is available, gnaw lets you
+browse BONE reports interactively.
 
-[[file:bone.png]]
+[[file:gnaw.png]]
 
 * Install
 
 Assuming [[https://github.com/babashka/bbin][bbin]] is installed:
 
-: bbin install io.github.bzg/bone
+: bbin install io.github.bzg/gnaw
 
 * Configure
 
-Create =~/.config/bone/config.edn=:
+Create =~/.config/gnaw/config.edn=:
 
 #+begin_src clojure
 {:my-addresses ["you@example.com" "alias@example.com"]
@@ -34,12 +34,12 @@ Create =~/.config/bone/config.edn=:
 - =:my-addresses= — your email address(es), used by =-m= to filter reports
   involving you. Can be a single string or a vector of strings.
 - =:text-browser= — terminal browser for viewing reports on =RET=. When
-  unset, bone probes for =w3m=, =lynx=, =links=, then falls back to
+  unset, gnaw probes for =w3m=, =lynx=, =links=, then falls back to
   =xdg-open=.
-- =:diff-pager= — pager for viewing patches on =C-v=. When unset, bone
+- =:diff-pager= — pager for viewing patches on =C-v=. When unset, gnaw
   probes for =delta=, =bat=, then falls back to =$PAGER= or =less=.
 - =:sources= — vector of report sources. Each source is a map with:
-  - =:urls= — a non-empty vector of URLs/paths to BARK =reports.json= files
+  - =:urls= — a non-empty vector of URLs/paths to BONE =reports.json= files
     whose reports are merged into one source (e.g. an =all-open.json= and an
     =all-closed.json=).
   - =:name= — the source's name. It is the *unique key* of a source: two
@@ -51,18 +51,18 @@ Create =~/.config/bone/config.edn=:
 
 When adding an HTTP source, you may pass the full reports URL
 (=.../reports/all.json=), another report file (=.../reports/all-open.json=),
-or just the base URL (=https://tracker.orgmode.org=): bone resolves a bare
+or just the base URL (=https://tracker.orgmode.org=): gnaw resolves a bare
 base to =reports/all.json= and reads =reports/meta.json= to record =:name=.
 - =:skip-columns= — vector of column names to hide by default (e.g.
   =["priority" "score"]=).
-- =:report= — configuration for =bone report= (see [[*Triage report][Triage report]]).
+- =:report= — configuration for =gnaw report= (see [[*Triage report][Triage report]]).
 
 * Usage
 
-: bone [options]
-: bone report [options]
-: bone clear
-: bone update
+: gnaw [options]
+: gnaw report [options]
+: gnaw clear
+: gnaw update
 
 ** Options
 
@@ -82,7 +82,7 @@ base to =reports/all.json= and reads =reports/meta.json= to record =:name=.
 
 ** Triage report
 
-=bone report= prints a text triage report to stdout.  It accepts the
+=gnaw report= prints a text triage report to stdout.  It accepts the
 same filtering options as interactive mode (=-f=, =-u=, =-m=, =-c=, etc.).
 
 The report includes the following sections: overview, stale patches,
@@ -111,11 +111,11 @@ The report can be configured in =config.edn= under the =:report= key:
 | =-r=, =--remove-source URL_OR_PATH= | Remove a source           |
 | =-l=, =--list-sources=              | List configured sources   |
 
-Sources are stored in =~/.config/bone/config.edn= under the =:sources= key.
+Sources are stored in =~/.config/gnaw/config.edn= under the =:sources= key.
 
 =--add-source= accepts either a direct =reports.json= URL/path, which is
 added as-is, or a tracker /base URL/ (e.g. =https://tracker.orgmode.org=).
-Given a base URL, bone reads =reports/meta.json= for the source name and the
+Given a base URL, gnaw reads =reports/meta.json= for the source name and the
 list of available report files, then lets you pick which to add (via fzf, or
 a numbered prompt when fzf is absent). The chosen files are grouped into one
 named source:
@@ -133,8 +133,8 @@ named source:
 | =clear=   | Empty the cache                       |
 | =update=  | Fetch/update reports from all sources |
 
-By default, bone reads cached reports if available. If no cache
-exists, it fetches from sources once and caches the result. Use =bone
+By default, gnaw reads cached reports if available. If no cache
+exists, it fetches from sources once and caches the result. Use =gnaw
 update= to refresh.
 
 ** Interactive keys (fzf)
@@ -158,43 +158,43 @@ update= to refresh.
 
 Browse your reports from a local file:
 
-: bone -f reports.json -m
+: gnaw -f reports.json -m
 
 Browse all reports from a remote URL:
 
-: bone -u https://example.com/reports.json
+: gnaw -u https://example.com/reports.json
 
-Merge reports from multiple BARK instances:
+Merge reports from multiple BONE instances:
 
-: bone -U my-urls.txt
+: gnaw -U my-urls.txt
 
 The URLs file (=-U=) lists one URL per line; blank lines and =#=
 comments are ignored.
 
 Add a source and browse:
 
-: bone -a https://example.com/reports.json
-: bone
+: gnaw -a https://example.com/reports.json
+: gnaw
 
 Update cached reports and browse only yours:
 
-: bone update
-: bone -m
+: gnaw update
+: gnaw -m
 
 * Files
 
 | Path                          | Purpose                        |
 |-------------------------------+--------------------------------|
-| =~/.config/bone/config.edn=     | User configuration and sources |
-| =~/.config/bone/cache/patches/= | Cached patches                 |
-| =~/.config/bone/cache/reports/= | Cached reports.json files      |
+| =~/.config/gnaw/config.edn=     | User configuration and sources |
+| =~/.config/gnaw/cache/patches/= | Cached patches                 |
+| =~/.config/gnaw/cache/reports/= | Cached reports.json files      |
 
 * Contributing
 
-- Send a [[mailto:~bzg/barkyard@lists.sr.ht][bug report]] with =[BUG] bone: <SHORT EXPLICIT BUG DESCRIPTION>=
-- Send a [[mailto:~bzg/barkyard@lists.sr.ht][patch]] with =[PATCH] bone: <COMMIT SUMMARY>=
-- Send a [[mailto:~bzg/barkyard@lists.sr.ht][feature request]] with =[FR] bone: <FEATURE REQUEST>=
-- Share any [[mailto:~bzg/barkyard@lists.sr.ht][other question or idea]]
+- Send a [[mailto:~bzg/boneyard@lists.sr.ht][bug report]] with =[BUG] gnaw: <SHORT EXPLICIT BUG DESCRIPTION>=
+- Send a [[mailto:~bzg/boneyard@lists.sr.ht][patch]] with =[PATCH] gnaw: <COMMIT SUMMARY>=
+- Send a [[mailto:~bzg/boneyard@lists.sr.ht][feature request]] with =[FR] gnaw: <FEATURE REQUEST>=
+- Share any [[mailto:~bzg/boneyard@lists.sr.ht][other question or idea]]
 
 You can also [[mailto:bzg@bzg.fr][send me an email]] and support my work on [[https://liberapay.com/bzg/][liberapay]].
 
@@ -202,7 +202,7 @@ You can also [[mailto:bzg@bzg.fr][send me an email]] and support my work on [[ht
 
 This project uses [[https://intver.org][Intentional Versioning]], here are the three audiences:
 
-- =Users= : end users who browse BARK reports with bone
+- =Users= : end users who browse BONE reports with gnaw
 - =Integrators= : external packagers
 - =Maintainers= : maintainers of the codebase
 

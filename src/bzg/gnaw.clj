@@ -1,20 +1,20 @@
 #!/usr/bin/env bb
 
-;; bone.clj — Browse BARK reports interactively.
+;; gnaw.clj — Browse BONE reports interactively.
 ;;
-;; Standalone CLI tool: reads JSON produced by bark export from a file,
+;; Standalone CLI tool: reads JSON produced by bone export from a file,
 ;; a URL, stdin, or a URLs file listing multiple report sources.
 ;; Displays via fzf (with detail on selection) or plain text fallback.
 ;;
-;; Configuration (~/.config/bone/config.edn):
+;; Configuration (~/.config/gnaw/config.edn):
 ;;   {:my-addresses ["you@example.com" "alias@example.com"]}
 ;;
 ;; Usage:
-;;   bone.clj [options]
-;;   bone.clj clear           Empty the cache
-;;   bone.clj update          Fetch/update reports from all sources
-;;   bone.clj report          Print a triage summary for maintainers
-;;   bone.clj prune           Drop state marks for reports no longer in any source
+;;   gnaw.clj [options]
+;;   gnaw.clj clear           Empty the cache
+;;   gnaw.clj update          Fetch/update reports from all sources
+;;   gnaw.clj report          Print a triage summary for maintainers
+;;   gnaw.clj prune           Drop state marks for reports no longer in any source
 ;;
 ;; Options:
 ;;   -f, --file FILE          Read reports from a JSON file
@@ -30,13 +30,13 @@
 ;;                            report files to add (reads reports/meta.json)
 ;;   -r, --remove-source PATH Remove a reports.json source
 ;;   -l, --list-sources       List configured sources
-;;   -t, --test-config        Verify ~/.config/bone/config.edn
+;;   -t, --test-config        Verify ~/.config/gnaw/config.edn
 ;;   -h, --help               Show help
 ;;   -                        Read JSON from stdin
 ;;
-;; By default, bone shows all open reports from configured sources.
+;; By default, gnaw shows all open reports from configured sources.
 
-(ns bzg.bone
+(ns bzg.gnaw
   (:require [babashka.process :as process]
             [babashka.http-client :as http]
             [babashka.fs :as fs]
@@ -51,10 +51,10 @@
 ;; ---------------------------------------------------------------------------
 
 (def config-path
-  (str (System/getProperty "user.home") "/.config/bone/config.edn"))
+  (str (System/getProperty "user.home") "/.config/gnaw/config.edn"))
 
 (def cache-dir
-  (str (System/getProperty "user.home") "/.config/bone/cache"))
+  (str (System/getProperty "user.home") "/.config/gnaw/cache"))
 
 (def patches-cache-dir
   (str cache-dir "/patches"))
@@ -76,7 +76,7 @@
         (catch Exception e
           (throw (ex-info (str "Config file is ill-formed: " config-path
                                "\n  " (.getMessage e)
-                               "\n  Run `bone -t` to check the config.")
+                               "\n  Run `gnaw -t` to check the config.")
                           {}))))
       {})))
 
@@ -253,13 +253,13 @@
     [@errors @warnings]))
 
 (defn- test-config!
-  "Verify ~/.config/bone/config.edn. Returns true when valid (no errors)."
+  "Verify ~/.config/gnaw/config.edn. Returns true when valid (no errors)."
   []
   (println (str "Checking: " config-path))
   (let [f (io/file config-path)]
     (cond
       (not (.exists f))
-      (do (println "Config file does not exist. bone will run with defaults.")
+      (do (println "Config file does not exist. gnaw will run with defaults.")
           true)
       :else
       (let [parsed (try (edn/read-string (slurp f))
@@ -287,10 +287,10 @@
 ;; Data loading
 ;; ---------------------------------------------------------------------------
 
-(def min-bark-format "0.9.1")
+(def min-bone-format "0.9.1")
 
 (def ^:private related-kind-keys
-  "Per-kind relation fields emitted by bark 0.9.0. Each holds a vector of
+  "Per-kind relation fields emitted by bone 0.9.0. Each holds a vector of
   `{:message-id ... :type ... :subject ... :archived-at ...}` entries."
   [:related-to :resolves :resolved-by
    :supersedes :superseded-by
@@ -345,7 +345,7 @@
             dir))))))
 
 (defn- source-base-url
-  "Derive a base URL from an HTTP source URL.  BARK serves the JSON from a
+  "Derive a base URL from an HTTP source URL.  BONE serves the JSON from a
   `reports/` subdirectory while attachments (patches/, events/, text/) are
   siblings of `reports/`.  So we strip the filename, then strip `reports/`
   when present.
@@ -373,7 +373,7 @@
 (defn- resolve-source-url
   "Normalize a user-supplied source URL to a concrete reports JSON file.
   A URL already ending in .json is returned unchanged; a bare host or base
-  URL is resolved to its reports/all.json (BARK's default layout).
+  URL is resolved to its reports/all.json (BONE's default layout).
   E.g. \"https://tracker.orgmode.org\"               => \".../reports/all.json\"
        \"https://tracker.orgmode.org/reports\"       => \".../reports/all.json\"
        \"https://tracker.orgmode.org/reports/x.json\" => unchanged"
@@ -405,7 +405,7 @@
 (defn- resolve-source
   "Normalize a single *.json URL/path into a {:urls [resolved] [:name ...]} map.
   HTTP base URLs are resolved to reports/all.json; the sibling meta.json is
-  read to fill in :name (BARK's :source). Sources are always stored under
+  read to fill in :name (BONE's :source). Sources are always stored under
   :urls. :name is left absent when meta.json is unreachable; the caller
   decides what to do (a source needs a unique :name)."
   [input]
@@ -417,12 +417,12 @@
   "Unwrap a reports.json envelope. Returns {:reports [...]}.
   Injects :source and :base-url from envelope into each report."
   [data & [src]]
-  (let [fv (:bark-format data)]
-    (when (and fv (version-< fv min-bark-format))
+  (let [fv (:bone-format data)]
+    (when (and fv (version-< fv min-bone-format))
       (binding [*out* *err*]
-        (println (str "Warning: bark-format " fv
+        (println (str "Warning: bone-format " fv
                       " is older than minimum supported version "
-                      min-bark-format
+                      min-bone-format
                       (when src (str " (source: " src ")"))))))
     (let [reports  (or (:reports data) [])
           src-name (:source data)
@@ -548,8 +548,8 @@
   (let [sources (load-sources)]
     (when (empty? sources)
       (throw (ex-info (str "No sources configured and no -f/-u/-U/- given.\n"
-                           "Add a source:  bone --add-source URL_OR_PATH\n"
-                           "Or use:        bone -f FILE | -u URL | -")
+                           "Add a source:  gnaw --add-source URL_OR_PATH\n"
+                           "Or use:        gnaw -f FILE | -u URL | -")
                       {})))
     (-> (merge-results
          (for [s   sources
@@ -564,24 +564,24 @@
         (update :reports dedup-by-message-id))))
 
 ;; ---------------------------------------------------------------------------
-;; Local state (~/.config/bone/state.edn)
+;; Local state (~/.config/gnaw/state.edn)
 ;;
 ;; Per-report `flag` (nil or :sticky) and `skip-since` (set when the user skips an
 ;; item to hide it).  Persisted as EDN, one entry per line so it
 ;; stays hand-editable and greppable. Keyed by RFC-2822 message-id, which is
-;; stable across re-fetches and globally unique. (`bone todo` exports the
+;; stable across re-fetches and globally unique. (`gnaw todo` exports the
 ;; :sticky entries to a separate todo.org for Emacs.)
 ;; ---------------------------------------------------------------------------
 
 (def state-edn-path
-  (str (System/getProperty "user.home") "/.config/bone/state.edn"))
+  (str (System/getProperty "user.home") "/.config/gnaw/state.edn"))
 
 (def todo-org-path
-  "Where `bone todo` writes the exported Org file."
-  (str (System/getProperty "user.home") "/.config/bone/todo.org"))
+  "Where `gnaw todo` writes the exported Org file."
+  (str (System/getProperty "user.home") "/.config/gnaw/todo.org"))
 
 (def ^:private org-header
-  "#+TITLE: bone state\n#+TODO: TODO | DONE\n\n")
+  "#+TITLE: gnaw state\n#+TODO: TODO | DONE\n\n")
 
 (def ^:private flag->keyword
   {:sticky "TODO" :done "DONE"})
@@ -674,7 +674,7 @@
     (let [missing (remove #(.exists (io/file (source->cache-file %))) all-urls)]
       (when (seq missing)
         (throw (ex-info (str "Cannot prune: cache missing for "
-                             (count missing) " source URL(s). Run `bone update` first.\n  "
+                             (count missing) " source URL(s). Run `gnaw update` first.\n  "
                              (str/join "\n  " missing))
                         {}))))
     (let [state    (load-state)
@@ -1002,7 +1002,7 @@
 (def ^:private ansi-italic-off "\u001b[23m")
 
 (defn- decorate-subject
-  "Mirror bark's web view conventions for closed reports:
+  "Mirror bone's web view conventions for closed reports:
    - canceled / superseded → italic + Unicode strikethrough
    - other closed (resolved, expired, …) → italic only
    - open → plain.
@@ -1035,7 +1035,7 @@
   (if-let [d (days-until report :deadline)] (str d) ""))
 
 (defn- display-type
-  "Map a BARK report type to its short display form."
+  "Map a BONE report type to its short display form."
   [t]
   (case t "announcement" "announce" t))
 
@@ -1047,7 +1047,7 @@
 (defn- report-flags+score
   "Compute flags string and numeric score from report fields.
   Flags: A=acked O=owned, third char: C=canceled R=resolved E=expired S=superseded -=open.
-  Score matches bark-index.clj: acked=1, owned=2, open=4 (closed=0)."
+  Score matches bone-index.clj: acked=1, owned=2, open=4 (closed=0)."
   [report]
   (let [a? (:acked report)
         o? (:owned report)
@@ -1139,10 +1139,10 @@
     (catch Exception _ false)))
 
 (defn- tmp-path
-  "Build /tmp/bone-<tag>-<ts><ext> for a temp file. Pass a single shared
+  "Build /tmp/gnaw-<tag>-<ts><ext> for a temp file. Pass a single shared
   timestamp when several related files must be cleaned up together."
   [tag ts ext]
-  (str (System/getProperty "java.io.tmpdir") "/bone-" tag "-" ts ext))
+  (str (System/getProperty "java.io.tmpdir") "/gnaw-" tag "-" ts ext))
 
 (defn- tabulate
   "Align tab-separated rows into fixed-width columns."
@@ -1320,10 +1320,10 @@
 ;; Source discovery (`--add-source`)
 ;;
 ;; A direct *.json URL/path is added as-is. A bare/base URL is treated as a
-;; tracker: bone reads reports/meta.json for the source :name and its
+;; tracker: gnaw reads reports/meta.json for the source :name and its
 ;; :reports-files (the JSON files that hold reports, as opposed to meta.json/
 ;; votes.json/stats.json), then lets the user pick which to add. Trackers
-;; predating bark-format 0.9.3 lack :reports-files, so we fall back to
+;; predating bone-format 0.9.3 lack :reports-files, so we fall back to
 ;; scraping the directory listing.
 ;; ---------------------------------------------------------------------------
 
@@ -1528,24 +1528,24 @@
     ;; output, so a no-op (e.g. C-v on a report with no attachments) doesn't
     ;; flash an empty popup. Help uses an exact-fit height; view/open use a
     ;; generous one (browsers often need room).
-    (.append sb (str "if [ -n \"$TMUX\" ] && [ -z \"$BONE_IN_POPUP\" ]; then\n"
+    (.append sb (str "if [ -n \"$TMUX\" ] && [ -z \"$GNAW_IN_POPUP\" ]; then\n"
                      "  case \"$ACTION:$N\" in\n"
                      "    help:*)\n"
                      "      exec tmux display-popup -E -h " help-rows " -w 90% -y S \\\n"
-                     "        \"BONE_IN_POPUP=1 sh " self " help\" ;;\n"
+                     "        \"GNAW_IN_POPUP=1 sh " self " help\" ;;\n"
                      (when (seq view-ns)
                        (str "    " (str/join "|" (map #(str "view:" %) view-ns)) ")\n"
                             "      exec tmux display-popup -E -h 90% -w 90% -y S \\\n"
-                            "        \"BONE_IN_POPUP=1 sh " self " view '$N'\" ;;\n"))
+                            "        \"GNAW_IN_POPUP=1 sh " self " view '$N'\" ;;\n"))
                      (when (seq open-ns)
                        (str "    " (str/join "|" (map #(str "open:" %) open-ns)) ")\n"
                             "      exec tmux display-popup -E -h 90% -w 90% -y S \\\n"
-                            "        \"BONE_IN_POPUP=1 sh " self " open '$N'\" ;;\n"))
+                            "        \"GNAW_IN_POPUP=1 sh " self " open '$N'\" ;;\n"))
                      "  esac\n"
                      "fi\n"))
-    ;; Lazy fetch helper: bone_fetch URL CACHE_PATH
+    ;; Lazy fetch helper: gnaw_fetch URL CACHE_PATH
     (.append sb (str/join "\n"
-                          ["bone_fetch() {"
+                          ["gnaw_fetch() {"
                            "  local url=\"$1\" dest=\"$2\""
                            "  if [ ! -f \"$dest\" ]; then"
                            "    mkdir -p \"$(dirname \"$dest\")\""
@@ -1591,7 +1591,7 @@
                                   (shell-escape plain-pager) " " path))
                   emit-fetch-and-page
                   (fn [{:keys [url cache-path]} diff?]
-                    (str "    bone_fetch " (shell-escape url) " " (shell-escape cache-path) "\n"
+                    (str "    gnaw_fetch " (shell-escape url) " " (shell-escape cache-path) "\n"
                          "    " (if diff?
                                   (page-cmd-str pager stdin? dsf? (shell-escape cache-path))
                                   (plain-page (shell-escape cache-path)))
@@ -1724,7 +1724,7 @@
                                  :types nil :sources nil :topics nil))))
     (println "  Cache update not available for this data source.")))
 
-(def ^:private bone-script-path
+(def ^:private gnaw-script-path
   (or (System/getProperty "babashka.file") *file*))
 
 (defn display-reports!
@@ -1741,10 +1741,10 @@
         dispatch-path (tmp-path "dispatch" ts ".sh")
         session-path  (tmp-path "session"  ts ".json")
         help-path     (tmp-path "help"     ts ".txt")
-        bb-bone       (str "bb " (shell-escape bone-script-path) " ")
+        bb-gnaw       (str "bb " (shell-escape gnaw-script-path) " ")
         sess          (shell-escape session-path)
-        print-list    (str bb-bone "--internal-print " sess)
-        rebuild       (str bb-bone "--internal-rebuild-dispatch "
+        print-list    (str bb-gnaw "--internal-print " sess)
+        rebuild       (str bb-gnaw "--internal-rebuild-dispatch "
                            (shell-escape dispatch-path) " "
                            (shell-escape help-path) " " sess)
         ;; Refresh dispatch + list after a session mutation. Chained
@@ -1757,8 +1757,8 @@
                         ;; execute-silent keeps fzf from releasing its screen
                         ;; so the main list stays drawn while the tmux popup
                         ;; (or fallback inline picker) overlays it.
-                        (str key ":execute-silent(" bb-bone sub " " sess ")" refresh))
-        clear-bind    (str "ctrl-x:execute-silent(" bb-bone "--internal-clear-filters "
+                        (str key ":execute-silent(" bb-gnaw sub " " sess ")" refresh))
+        clear-bind    (str "ctrl-x:execute-silent(" bb-gnaw "--internal-clear-filters "
                            sess ")" refresh)]
     (if (empty? reports)
       (println "No reports found.")
@@ -2024,25 +2024,25 @@
    :list-sources  {:alias :l :coerce :boolean :desc "List configured sources"}
    :add-source    {:alias :a :coerce :string :desc "Add a source" :ref "<URL>"}
    :remove-source {:alias :r :coerce :string :desc "Remove a source" :ref "<URL>"}
-   :test-config   {:alias :t :coerce :boolean :desc "Verify ~/.config/bone/config.edn"}
+   :test-config   {:alias :t :coerce :boolean :desc "Verify ~/.config/gnaw/config.edn"}
    :dry-run       {:coerce :boolean :desc "With `prune`: list orphan entries without removing them"}
    :help          {:alias :h :coerce :boolean :desc "Show this help"}})
 
 (defn- usage []
-  (println "Usage: bone [COMMAND] [OPTIONS]")
+  (println "Usage: gnaw [COMMAND] [OPTIONS]")
   (println)
   (println "Commands:")
   (println "  update          Update the sources cache")
   (println "  clear           Clear the cache")
   (println "  report          Generate a triage summary")
-  (println "  todo            Export marked items to ~/.config/bone/todo.org")
+  (println "  todo            Export marked items to ~/.config/gnaw/todo.org")
   (println "  prune           Drop state marks for reports no longer in any source")
   (println)
   (println "Options:")
   (println (cli/format-opts {:spec cli-spec}))
   (println "  -               Read reports from stdin")
   (println)
-  (println "Local marks (kept in ~/.config/bone/state.edn):")
+  (println "Local marks (kept in ~/.config/gnaw/state.edn):")
   (println "  Alt-*  toggle :sticky (keep visible, column '*')")
   (println "  Alt-Enter toggle :skip (hide; column '_', shown only with --all)")
   (println "  Ctrl-h inside fzf shows the full keymap."))
@@ -2105,7 +2105,7 @@
         addrs (when addrs (if (string? addrs) [addrs] addrs))
         opts  (assoc opts :my-addresses addrs)]
     (when (and (:mine opts) (not (seq addrs)))
-      (throw (ex-info "No address configured. Set :my-addresses in ~/.config/bone/config.edn or use -M EMAIL[,EMAIL,...]." {})))
+      (throw (ex-info "No address configured. Set :my-addresses in ~/.config/gnaw/config.edn or use -M EMAIL[,EMAIL,...]." {})))
     opts))
 
 (defn -main [& args]
@@ -2162,7 +2162,7 @@
                                                     :view-mode view-mode))))
     (catch clojure.lang.ExceptionInfo e
       (binding [*out* *err*]
-        (println (str "bone: " (.getMessage e))))
+        (println (str "gnaw: " (.getMessage e))))
       (System/exit 1))))
 
 (when (= *file* (System/getProperty "babashka.file"))

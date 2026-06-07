@@ -1,2 +1,2 @@
 {:paths ["src/bzg"]
- :bbin/bin {bone {:main-opts ["-m" "bzg.bone"]}}}
+ :bbin/bin {gnaw {:main-opts ["-m" "bzg.gnaw"]}}}
