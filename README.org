@@ -174,7 +174,6 @@ comments are ignored.
 Add a source and browse:
 
 : gnaw -a https://example.com/reports.json
-: gnaw
 
 Update cached reports and browse only yours:
 
