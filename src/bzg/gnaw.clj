@@ -609,6 +609,14 @@
        (try (-> (java.time.OffsetDateTime/parse s (java.time.format.DateTimeFormatter/ofPattern "E, d MMM yyyy HH:mm:ss Z" java.util.Locale/US))
                 .toZonedDateTime)
             (catch Exception _ nil))
+       ;; RFC 2822 whose weekday name disagrees with the date (buggy mailers):
+       ;; strip the leading weekday and parse the rest, ignoring the DOW. The
+       ;; strict parsers above reject these; for triage the date is still useful.
+       (try (-> (java.time.OffsetDateTime/parse
+                 (str/replace-first s #"^[A-Za-z]{3,4},?\s+" "")
+                 (java.time.format.DateTimeFormatter/ofPattern "d MMM yyyy HH:mm:ss Z" java.util.Locale/US))
+                .toZonedDateTime)
+            (catch Exception _ nil))
        ;; 2. Standard ISO-8601
        (try (java.time.ZonedDateTime/parse s)
             (catch Exception _ nil))
@@ -1298,7 +1306,14 @@
 (defn- sort-reports [reports sort-idx]
   (let [[_ key-fn cmp needs] (nth sort-options sort-idx)
         user-state           (when (= needs :needs-state) (load-state))]
-    (sort-by #(key-fn % user-state) cmp reports)))
+    ;; Schwartzian transform: compute each report's sort key exactly once.
+    ;; clojure.core/sort-by re-invokes the key-fn on every comparison
+    ;; (O(n log n) calls), and the date key-fns reparse :date-raw through a
+    ;; cascade of try/catch format attempts — wasteful for large lists.
+    (->> reports
+         (mapv (fn [r] [(key-fn r user-state) r]))
+         (sort-by first cmp)
+         (mapv second))))
 
 (defn- pick-multi!
   "Let user pick from `all` via fzf multi-select.
@@ -1491,6 +1506,124 @@
         (str (str/join " " (map shell-escape pager-vec)) " < " file-var))
       (str (str/join " " (map shell-escape pager-vec)) " " file-var))))
 
+(def ^:private dispatch-preamble
+  (str "#!/bin/sh\n"
+       "ACTION=\"$1\"\n"
+       "N=\"$2\"\n"
+       ;; N is an fzf line index; force it numeric so embedding it in the tmux
+       ;; re-exec command and the case branches below is provably safe — no
+       ;; data ever transits two levels of shell parsing as a non-integer.
+       "case \"$N\" in ''|*[!0-9]*) N= ;; esac\n"))
+
+(def ^:private fetch-helper-block
+  ;; Lazy fetch helper: gnaw_fetch URL CACHE_PATH
+  (str/join "\n"
+            ["gnaw_fetch() {"
+             "  local url=\"$1\" dest=\"$2\""
+             "  if [ ! -f \"$dest\" ]; then"
+             "    mkdir -p \"$(dirname \"$dest\")\""
+             "    case \"$url\" in"
+             "      http://*|https://*) curl -sfLo \"$dest\" \"$url\" || wget -qO \"$dest\" \"$url\" ;;"
+             "      *) cp \"$url\" \"$dest\" ;;"
+             "    esac"
+             "  fi"
+             "}"
+             ""]))
+
+(defn- dispatch-tmux-block
+  "Tmux-popup wrapper. Only wraps actions that will actually produce output,
+  so a no-op (e.g. C-v on a report with no attachments) doesn't flash an empty
+  popup. Help uses an exact-fit height; view/open use a generous one (browsers
+  often need room). Emitted unconditionally — the runtime `[ -n \"$TMUX\" ]`
+  guard makes it a no-op outside tmux."
+  [self help-rows view-ns open-ns]
+  (str "if [ -n \"$TMUX\" ] && [ -z \"$GNAW_IN_POPUP\" ]; then\n"
+       "  case \"$ACTION:$N\" in\n"
+       "    help:*)\n"
+       "      exec tmux display-popup -E -h " help-rows " -w 90% -y S \\\n"
+       "        \"GNAW_IN_POPUP=1 sh " self " help\" ;;\n"
+       (when (seq view-ns)
+         (str "    " (str/join "|" (map #(str "view:" %) view-ns)) ")\n"
+              "      exec tmux display-popup -E -h 90% -w 90% -y S \\\n"
+              "        \"GNAW_IN_POPUP=1 sh " self " view '$N'\" ;;\n"))
+       (when (seq open-ns)
+         (str "    " (str/join "|" (map #(str "open:" %) open-ns)) ")\n"
+              "      exec tmux display-popup -E -h 90% -w 90% -y S \\\n"
+              "        \"GNAW_IN_POPUP=1 sh " self " open '$N'\" ;;\n"))
+       "  esac\n"
+       "fi\n"))
+
+(defn- dispatch-help-block [hf]
+  (str "if [ \"$ACTION\" = \"help\" ]; then\n"
+       "  less -R " hf "\n"
+       "  exit 0\n"
+       "fi\n"))
+
+(defn- dispatch-view-body
+  "The body of a report's `view:N)` case branch (between the label and the
+  trailing `;;`), or nil when the report has no attachments. Single attachment
+  pages directly; multiple ones go through an inner fzf picker."
+  [report pager stdin? dsf? plain-pager]
+  (let [groups (cond-> []
+                 (seq (patch-paths report)) (conj {:label "patch" :items (patch-paths report) :diff? true})
+                 (seq (event-paths report)) (conj {:label "event" :items (event-paths report) :diff? false})
+                 (seq (text-paths report))  (conj {:label " text" :items (text-paths report)  :diff? false}))]
+    (when (seq groups)
+      (let [plain-page
+            ;; LESS env covers the case where $PAGER is something other
+            ;; than less; explicit args win when it IS less.
+            (fn [path] (str (when tmux? "LESS='-R +g' ")
+                            (shell-escape plain-pager) " " path))
+            emit-fetch-and-page
+            (fn [{:keys [url cache-path]} diff?]
+              (str "    gnaw_fetch " (shell-escape url) " " (shell-escape cache-path) "\n"
+                   "    " (if diff?
+                            (page-cmd-str pager stdin? dsf? (shell-escape cache-path))
+                            (plain-page (shell-escape cache-path)))
+                   "\n"))]
+        (if (and (= 1 (count groups)) (= 1 (count (:items (first groups)))))
+          ;; Single attachment — no picker needed
+          (emit-fetch-and-page (first (:items (first groups))) (:diff? (first groups)))
+          ;; Flatten all attachments into one picker with "label: filename" entries
+          (let [entries (for [{:keys [label items diff?]} groups
+                              item items]
+                          {:label (str label ": " (last (str/split (:url item) #"/")))
+                           :item item
+                           :diff? diff?})
+                entry-labels (mapv :label entries)]
+            (str "    PICK=$(printf "
+                 (shell-escape (str/join "\\n" entry-labels))
+                 " | fzf --prompt 'view> ' --no-sort --reverse)\n"
+                 "    [ -z \"$PICK\" ] && exit 0\n"
+                 "    case \"$PICK\" in\n"
+                 (str/join (for [{:keys [label item diff?]} entries]
+                             (str "      " (shell-escape label) ")\n"
+                                  "    " (emit-fetch-and-page item diff?)
+                                  "        ;;\n")))
+                 "    esac\n")))))))
+
+(defn- dispatch-report-branch
+  "The `case` branches for one visible report at index n: open/browse (when it
+  has an archive URL) and view (when it has attachments). Empty string when the
+  report offers neither."
+  [n report browse opener pager stdin? dsf? plain-pager]
+  (let [url       (:archived-at report)
+        view-body (dispatch-view-body report pager stdin? dsf? plain-pager)]
+    (str
+     ;; open (text browser / enter) + browse (system browser / ctrl-o)
+     (when url
+       (str "  open:" n ")\n"
+            "    " (str/join " " (map shell-escape (conj browse url))) "\n"
+            "    ;;\n"
+            "  browse:" n ")\n"
+            "    " (str/join " " (map shell-escape (conj opener url))) "\n"
+            "    ;;\n"))
+     ;; view (any attachment — patch, ics, txt / ctrl-v)
+     (when view-body
+       (str "  view:" n ")\n"
+            view-body
+            "    ;;\n")))))
+
 (defn- write-dispatch-script!
   "Write a temp shell script that maps fzf line numbers to actions.
   The script takes two args: ACTION (open|view|browse|help) and LINE_NUMBER.
@@ -1502,123 +1635,31 @@
   that would be silent (e.g. C-v on a report with no attachments) bypass the
   popup entirely — no flash."
   [dispatch-path help-path config visible]
-  (let [browse  (browse-cmd config)
-        pager   (patch-pager config)
-        stdin?  (stdin-diff-pagers (first pager))
-        dsf?    (= "diff-so-fancy" (first pager))
+  (let [browse      (browse-cmd config)
+        opener      (platform-opener)
+        pager       (patch-pager config)
+        stdin?      (stdin-diff-pagers (first pager))
+        dsf?        (= "diff-so-fancy" (first pager))
         plain-pager (or (System/getenv "PAGER") "less")
-        sb      (StringBuilder.)
-        hf      (shell-escape help-path)
-        self    (shell-escape dispatch-path)
+        hf          (shell-escape help-path)
+        self        (shell-escape dispatch-path)
         ;; help fits this many lines (text + a couple for the less prompt).
-        help-rows (+ 4 (count (str/split-lines usage-text)))
+        help-rows   (+ 4 (count (str/split-lines usage-text)))
         ;; Per-N indices for actions that produce output worth popping.
-        view-ns (->> visible
-                     (map-indexed vector)
-                     (keep (fn [[n r]]
-                             (when (or (seq (patch-paths r))
-                                       (seq (event-paths r))
-                                       (seq (text-paths r)))
-                               n))))
-        open-ns (->> visible
-                     (map-indexed vector)
-                     (keep (fn [[n r]] (when (:archived-at r) n))))]
-    (.append sb "#!/bin/sh\nACTION=\"$1\"\nN=\"$2\"\n")
-    ;; Tmux-popup wrapper. Only wraps actions that will actually produce
-    ;; output, so a no-op (e.g. C-v on a report with no attachments) doesn't
-    ;; flash an empty popup. Help uses an exact-fit height; view/open use a
-    ;; generous one (browsers often need room).
-    (.append sb (str "if [ -n \"$TMUX\" ] && [ -z \"$GNAW_IN_POPUP\" ]; then\n"
-                     "  case \"$ACTION:$N\" in\n"
-                     "    help:*)\n"
-                     "      exec tmux display-popup -E -h " help-rows " -w 90% -y S \\\n"
-                     "        \"GNAW_IN_POPUP=1 sh " self " help\" ;;\n"
-                     (when (seq view-ns)
-                       (str "    " (str/join "|" (map #(str "view:" %) view-ns)) ")\n"
-                            "      exec tmux display-popup -E -h 90% -w 90% -y S \\\n"
-                            "        \"GNAW_IN_POPUP=1 sh " self " view '$N'\" ;;\n"))
-                     (when (seq open-ns)
-                       (str "    " (str/join "|" (map #(str "open:" %) open-ns)) ")\n"
-                            "      exec tmux display-popup -E -h 90% -w 90% -y S \\\n"
-                            "        \"GNAW_IN_POPUP=1 sh " self " open '$N'\" ;;\n"))
-                     "  esac\n"
-                     "fi\n"))
-    ;; Lazy fetch helper: gnaw_fetch URL CACHE_PATH
-    (.append sb (str/join "\n"
-                          ["gnaw_fetch() {"
-                           "  local url=\"$1\" dest=\"$2\""
-                           "  if [ ! -f \"$dest\" ]; then"
-                           "    mkdir -p \"$(dirname \"$dest\")\""
-                           "    case \"$url\" in"
-                           "      http://*|https://*) curl -sfLo \"$dest\" \"$url\" || wget -qO \"$dest\" \"$url\" ;;"
-                           "      *) cp \"$url\" \"$dest\" ;;"
-                           "    esac"
-                           "  fi"
-                           "}"
-                           ""]))
-    (.append sb (str "if [ \"$ACTION\" = \"help\" ]; then\n"
-                     "  less -R " hf "\n"
-                     "  exit 0\n"
-                     "fi\n"))
-    (.append sb "case \"$ACTION:$N\" in\n")
-    (doseq [[n report] (map-indexed vector visible)]
-      (let [url  (:archived-at report)
-            ps   (patch-paths report)
-            es   (event-paths report)
-            ts   (text-paths report)]
-        ;; open action (text browser / enter)
-        (when url
-          (.append sb (str "  open:" n ")\n"))
-          (.append sb (str "    " (str/join " " (map shell-escape (conj browse url))) "\n"))
-          (.append sb "    ;;\n"))
-        ;; browse action (system browser / ctrl-o)
-        (when url
-          (.append sb (str "  browse:" n ")\n"))
-          (let [opener (platform-opener)]
-            (.append sb (str "    " (str/join " " (map shell-escape (conj opener url))) "\n")))
-          (.append sb "    ;;\n"))
-        ;; view action — view any attachment (patch, ics, txt)
-        (let [groups (cond-> []
-                       (seq ps) (conj {:label "patch" :items ps :diff? true})
-                       (seq es) (conj {:label "event" :items es :diff? false})
-                       (seq ts) (conj {:label " text" :items ts :diff? false}))]
-          (when (seq groups)
-            (.append sb (str "  view:" n ")\n"))
-            (let [plain-page
-                  ;; LESS env covers the case where $PAGER is something other
-                  ;; than less; explicit args win when it IS less.
-                  (fn [path] (str (when tmux? "LESS='-R +g' ")
-                                  (shell-escape plain-pager) " " path))
-                  emit-fetch-and-page
-                  (fn [{:keys [url cache-path]} diff?]
-                    (str "    gnaw_fetch " (shell-escape url) " " (shell-escape cache-path) "\n"
-                         "    " (if diff?
-                                  (page-cmd-str pager stdin? dsf? (shell-escape cache-path))
-                                  (plain-page (shell-escape cache-path)))
-                         "\n"))]
-              (if (and (= 1 (count groups)) (= 1 (count (:items (first groups)))))
-                ;; Single attachment — no picker needed
-                (.append sb (emit-fetch-and-page (first (:items (first groups))) (:diff? (first groups))))
-                ;; Flatten all attachments into one picker with "label: filename" entries
-                (let [entries (for [{:keys [label items diff?]} groups
-                                    item items]
-                                {:label (str label ": " (last (str/split (:url item) #"/")))
-                                 :item item
-                                 :diff? diff?})
-                      entry-labels (mapv :label entries)]
-                  (.append sb (str "    PICK=$(printf "
-                                   (shell-escape (str/join "\\n" entry-labels))
-                                   " | fzf --prompt 'view> ' --no-sort --reverse)\n"))
-                  (.append sb "    [ -z \"$PICK\" ] && exit 0\n")
-                  (.append sb "    case \"$PICK\" in\n")
-                  (doseq [{:keys [label item diff?]} entries]
-                    (.append sb (str "      " (shell-escape label) ")\n"))
-                    (.append sb (str "    " (emit-fetch-and-page item diff?)))
-                    (.append sb "        ;;\n"))
-                  (.append sb "    esac\n"))))
-            (.append sb "    ;;\n")))))
-    (.append sb "esac\n")
-    (spit dispatch-path (str sb))
+        att?        (fn [r] (or (seq (patch-paths r)) (seq (event-paths r)) (seq (text-paths r))))
+        view-ns     (keep-indexed (fn [n r] (when (att? r) n)) visible)
+        open-ns     (keep-indexed (fn [n r] (when (:archived-at r) n)) visible)
+        script      (str dispatch-preamble
+                         (dispatch-tmux-block self help-rows view-ns open-ns)
+                         fetch-helper-block
+                         (dispatch-help-block hf)
+                         "case \"$ACTION:$N\" in\n"
+                         (str/join
+                          (map-indexed
+                           (fn [n r] (dispatch-report-branch n r browse opener pager stdin? dsf? plain-pager))
+                           visible))
+                         "esac\n")]
+    (spit dispatch-path script)
     (.setExecutable (io/file dispatch-path) true)
     dispatch-path))
 
@@ -1800,6 +1841,18 @@
                                      header     (column-headers show-type? show-src? skip)
                                      rows       (mapv #(report->row % show-type? show-src? skip user-state) visible)
                                      aligned    (tabulate (cons header rows))
+                                     ;; Append a hidden, tab-delimited visible
+                                     ;; index to every data row (not the
+                                     ;; header). fzf hides it via --with-nth 1
+                                     ;; but returns the full line on selection,
+                                     ;; so we read the index back unambiguously
+                                     ;; even when two rows render identically.
+                                     ;; `tabulate` strips all tabs, so the
+                                     ;; appended one is the only separator.
+                                     input      (str/join "\n"
+                                                          (cons (first aligned)
+                                                                (map-indexed (fn [i row] (str row "\t" i))
+                                                                             (rest aligned))))
                                      mid-index  (into {} (keep (fn [r]
                                                                  (when-let [m (:message-id r)]
                                                                    [m r])))
@@ -1809,11 +1862,11 @@
                                   :user-state user-state
                                   :session    session
                                   :visible    visible
-                                  :aligned    aligned
-                                  :input      (str/join "\n" aligned)
+                                  :input      input
                                   :mid-index  mid-index}))
-                  {:keys [user-state session visible aligned input mid-index]} ctx
+                  {:keys [user-state session visible input mid-index]} ctx
                   fzf-args   (cond-> ["fzf" "--ansi" "--header-lines" "1"
+                                      "--delimiter" "\t" "--with-nth" "1" "--nth" "1"
                                       "--header" (status-header
                                                   (:sort-idx session 0) session
                                                   (:all-types session)
@@ -1843,9 +1896,9 @@
                   key-used   (first lines)
                   selected   (second lines)
                   sel-idx    (when selected
-                               (some (fn [i] (when (= (nth aligned (inc i)) selected) i))
-                                     (range (count visible))))
-                  sel-report (when sel-idx (nth visible sel-idx))]
+                               (when-let [t (str/last-index-of selected "\t")]
+                                 (parse-long (subs selected (inc t)))))
+                  sel-report (when sel-idx (nth visible sel-idx nil))]
               (case key-used
                 "ctrl-/"
                 (do (when (and sel-report (seq (:related sel-report)))
@@ -1865,7 +1918,7 @@
             (.delete (io/file help-path))))
         ;; Plain text fallback
         (let [user-state (load-state)
-              visible    (->> reports
+              visible    (->> (startup-filter reports user-state view-mode)
                               (remove :closed)
                               (filter #(visible-by-state? user-state % view-mode)))]
           (println (count visible) "report(s):\n")
@@ -2063,7 +2116,8 @@
                   (:urls-file opts) (assoc opts :data-src :urls-file)
                   :else           opts)
         opts    (cond-> opts
-                  (:my-addresses opts) (update :my-addresses #(str/split % #","))
+                  ;; :my-addresses is normalized once in enrich-opts (it may
+                  ;; also come from config as a string or vector).
                   (:skip-columns opts) (update :skip-columns #(str/split % #",")))]
     [cmd opts]))
 
@@ -2097,12 +2151,21 @@
     min-priority               (filter #(>= (:priority % 0) min-priority))
     min-score                  (filter #(>= (:score (report-flags+score %)) min-score))))
 
+(defn- coerce-addresses
+  "Coerce a :my-addresses value into a vector of address strings, or nil.
+  Accepts a comma-separated string (from -M), a single string or a vector
+  (from config)."
+  [v]
+  (cond
+    (nil? v)    nil
+    (string? v) (str/split v #",")
+    :else       (vec v)))
+
 (defn- enrich-opts
   "Validate and enrich parsed CLI options with email from config."
   [opts config]
   (let [opts  (validate-opts! opts)
-        addrs (or (:my-addresses opts) (:my-addresses config))
-        addrs (when addrs (if (string? addrs) [addrs] addrs))
+        addrs (coerce-addresses (or (:my-addresses opts) (:my-addresses config)))
         opts  (assoc opts :my-addresses addrs)]
     (when (and (:mine opts) (not (seq addrs)))
       (throw (ex-info "No address configured. Set :my-addresses in ~/.config/gnaw/config.edn or use -M EMAIL[,EMAIL,...]." {})))
