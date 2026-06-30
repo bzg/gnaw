@@ -6,6 +6,12 @@
 ;; a URL, stdin, or a URLs file listing multiple report sources.
 ;; Displays via fzf (with detail on selection) or plain text fallback.
 ;;
+;; External tools: requires `bb` (babashka). The interactive view also uses
+;; `fzf` (falls back to plain text when absent) and `column` (falls back to a
+;; built-in aligner). Viewing attachments fetches with `curl` or `wget` and
+;; pages with $PAGER/less (or delta/bat/diff-so-fancy when configured);
+;; opening in a browser uses w3m/lynx/links or the platform opener.
+;;
 ;; Configuration (~/.config/gnaw/config.edn):
 ;;   {:my-addresses ["you@example.com" "alias@example.com"]}
 ;;
@@ -312,8 +318,8 @@
 (defn- version-< [a b]
   (loop [as (str/split a #"\.")
          bs (str/split b #"\.")]
-    (let [ai (parse-long (or (first as) "0"))
-          bi (parse-long (or (first bs) "0"))]
+    (let [ai (or (parse-long (or (first as) "0")) 0)
+          bi (or (parse-long (or (first bs) "0")) 0)]
       (cond
         (< ai bi) true
         (> ai bi) false
@@ -566,8 +572,8 @@
 ;; ---------------------------------------------------------------------------
 ;; Local state (~/.config/gnaw/state.edn)
 ;;
-;; Per-report `flag` (nil or :sticky) and `skip-since` (set when the user skips an
-;; item to hide it).  Persisted as EDN, one entry per line so it
+;; Per-report `sticky` and `dismiss` keys, each holding the ISO timestamp at
+;; which the mark was set (mutually exclusive).  Persisted as EDN, one entry per line so it
 ;; stays hand-editable and greppable. Keyed by RFC-2822 message-id, which is
 ;; stable across re-fetches and globally unique. (`gnaw todo` exports the
 ;; :sticky entries to a separate todo.org for Emacs.)
@@ -582,9 +588,6 @@
 
 (def ^:private org-header
   "#+TITLE: gnaw state\n#+TODO: TODO | DONE\n\n")
-
-(def ^:private flag->keyword
-  {:sticky "TODO" :done "DONE"})
 
 (def ^:private org-ts-fmt
   (java.time.format.DateTimeFormatter/ofPattern
@@ -723,8 +726,8 @@
   (when (and t (re-matches #"[a-zA-Z][\w-]*" (str t)))
     (str ":" (str/lower-case t) ":")))
 
-(defn- render-entry [mid {:keys [flag skip-since author subject type created]}]
-  (let [kw (flag->keyword flag)
+(defn- render-entry [mid {:keys [sticky dismiss author subject type created]}]
+  (let [kw (when sticky "TODO")
         tag (type->tag type)]
     (str "* " (when kw (str kw " ")) (or subject "(no subject)")
          (when tag (str "    " tag)) "\n"
@@ -734,8 +737,8 @@
            (str "  :CREATED:    " (format-org-timestamp created) "\n"))
          (when author
            (str "  :AUTHOR:     " author "\n"))
-         (when skip-since
-           (str "  :SKIP-SINCE: " (format-org-timestamp skip-since) "\n"))
+         (when dismiss
+           (str "  :DISMISS:    " (format-org-timestamp dismiss) "\n"))
          "  :END:\n")))
 
 (defn- render-org-state [state]
@@ -745,9 +748,9 @@
 
 (defn- write-todo-org!
   "Generate todo.org from the current state.edn, restricted to entries flagged
-  :sticky. Skipped entries are excluded. Returns [path n-todos]."
+  :sticky. Dismissed entries are excluded. Returns [path n-todos]."
   [out-path]
-  (let [todos (into {} (filter (fn [[_ v]] (= :sticky (:flag v))) (load-state)))]
+  (let [todos (into {} (filter (fn [[_ v]] (:sticky v)) (load-state)))]
     (.mkdirs (.getParentFile (io/file out-path)))
     (spit out-path (render-org-state todos))
     [out-path (count todos)]))
@@ -771,52 +774,49 @@
     (:date report)         (assoc :created (:date report))))
 
 (defn- apply-transition
-  "Apply an action ∈ #{:sticky :skip} to the state. The two marks are mutually
-  exclusive (:sticky clears a skip, :skip clears a flag); re-applying toggles
-  off. :skip is stored as :skip-since. Entries that end up with neither :flag nor
-  :skip-since are dissoc'd."
+  "Apply an action ∈ #{:sticky :dismiss} to the state. The two marks are mutually
+  exclusive (setting one clears the other); re-applying toggles off. Each mark is
+  stored under its own key (:sticky or :dismiss) as the ISO timestamp at which it
+  was set. Entries that end up with neither key are dissoc'd."
   [state action mid report]
   (if (nil? mid)
     state
     (let [base      (enrich-entry (or (get state mid) {}) report)
-          new-entry (case action
-                      :sticky (if (= (:flag base) :sticky)
-                                (dissoc base :flag)
-                                (-> base (dissoc :skip-since) (assoc :flag :sticky)))
-                      :skip (if (:skip-since base)
-                              (dissoc base :skip-since)
-                              (-> base (dissoc :flag) (assoc :skip-since (iso-now)))))]
-      (if (and (nil? (:flag new-entry)) (nil? (:skip-since new-entry)))
+          other     (if (= action :sticky) :dismiss :sticky)
+          new-entry (if (get base action)
+                      (dissoc base action)
+                      (-> base (dissoc other) (assoc action (iso-now))))]
+      (if (and (nil? (:sticky new-entry)) (nil? (:dismiss new-entry)))
         (dissoc state mid)
         (assoc state mid new-entry)))))
 
 (defn- visible-by-state?
   "Show a report given the local state and the active view mode.
-   :default and :all → everything (skipped items are dropped upstream by
-   `startup-filter` for :default; once the session is loaded, skipping an
+   :default and :all → everything (dismissed items are dropped upstream by
+   `startup-filter` for :default; once the session is loaded, dismissing an
    item keeps it visible until the next reload).
    :sticky → only :sticky."
   [state report view]
   (case view
-    :sticky (= (:flag (get state (:message-id report))) :sticky)
+    :sticky (boolean (:sticky (get state (:message-id report))))
     true))
 
 (defn- mark-prefix
-  "Single-character prefix for the leftmost column: '*' sticky, '_' skipped."
+  "Single-character prefix for the leftmost column: '*' sticky, 'd' dismissed."
   [state mid]
   (let [s (get state mid)]
-    (cond (= (:flag s) :sticky) "*"
-          (:skip-since s)          "_"
-          :else                 " ")))
+    (cond (:sticky s)  "*"
+          (:dismiss s) "d"
+          :else        " ")))
 
 (defn- startup-filter
-  "Apply the :default-mode startup filter: drop reports the user has skipped
-  (skip-since set, no active flag). Other view modes pass through unchanged."
+  "Apply the :default-mode startup filter: drop reports the user has dismissed
+  (:dismiss set, no active flag). Other view modes pass through unchanged."
   [reports user-state view-mode]
   (if (= view-mode :default)
     (remove (fn [r]
               (let [s (get user-state (:message-id r))]
-                (and (:skip-since s) (nil? (:flag s)))))
+                (and (:dismiss s) (nil? (:sticky s)))))
             reports)
     reports))
 
@@ -1152,14 +1152,37 @@
   [tag ts ext]
   (str (System/getProperty "java.io.tmpdir") "/gnaw-" tag "-" ts ext))
 
-(defn- tabulate
-  "Align tab-separated rows into fixed-width columns."
+(defn- align-columns
+  "Pure-Clojure column alignment, a fallback for when `column` is unavailable.
+  Every column but the last is space-padded to its widest cell."
   [rows]
-  (-> (process/shell {:in (str/join "\n" rows) :out :string}
-                     "column" "-t" "-s" "\t")
-      :out
-      str/trim
-      str/split-lines))
+  (let [split  (mapv #(str/split % #"\t" -1) rows)
+        ncol   (transduce (map count) max 0 split)
+        widths (mapv (fn [i] (transduce (map #(count (nth % i ""))) max 0 split))
+                     (range ncol))]
+    (mapv (fn [cols]
+            (->> cols
+                 (map-indexed
+                  (fn [i c]
+                    (if (= i (dec ncol))
+                      c
+                      (str c (apply str (repeat (- (nth widths i) (count c)) \space))))))
+                 (str/join "  ")
+                 str/trimr))
+          split)))
+
+(defn- tabulate
+  "Align tab-separated rows into fixed-width columns via `column`, falling back
+  to a pure-Clojure alignment when `column` is unavailable."
+  [rows]
+  (try
+    (-> (process/shell {:in (str/join "\n" rows) :out :string :err :string}
+                       "column" "-t" "-s" "\t")
+        :out
+        str/trim
+        str/split-lines)
+    (catch Exception _
+      (align-columns rows))))
 
 (defn- command-available? [cmd]
   (try
@@ -1200,7 +1223,12 @@
           src-name   (or (:source report) "default")]
       (mapv (fn [a]
               (let [file       (:file a)
-                    cache-file (str/replace-first file #"^(\.\./?)+" "")]
+                    ;; Drop every ""/"."/".." path segment (not just a leading
+                    ;; run) so a crafted attachment file cannot escape the cache
+                    ;; directory via embedded or absolute path traversal.
+                    cache-file (->> (str/split (or file "") #"/")
+                                    (remove #{".." "." ""})
+                                    (str/join "/"))]
                 {:url        (if base (str base subdir "/" file) file)
                  :cache-path (str cache-dir "/" src-name "/" cache-file)}))
             atts))))
@@ -1268,8 +1296,7 @@
    ["type"              (fn [r _] (display-type (:type r "")))                                   compare]
    ["marked (sticky first)"
     (fn [r state]
-      (let [flag (:flag (get state (:message-id r)))
-            group (if (= flag :sticky) 0 1)]
+      (let [group (if (:sticky (get state (:message-id r))) 0 1)]
         [group (- (parse-date-ms (:date-raw r)))]))
     compare :needs-state]])
 
@@ -1471,11 +1498,11 @@
     "  Ctrl-x                     Remove all filters"
     "  Ctrl-u                     Update cache and reload"
     "  Alt-*                      Toggle :sticky (keep visible, column '*')"
-    "  Alt-Enter                  Toggle :skip (hide; column '_', shown only with --all)"
+    "  Alt-Enter                  Toggle dismiss (hide; column 'd', shown only with --all)"
     "  Ctrl-h                     Show this help"
     ""
     "Columns:"
-    "  !       Local mark: '*' = :sticky, '_' = :skip"
+    "  !       Local mark: '*' = sticky, 'd' = dismiss"
     "  P       Priority: A = high, B = medium, C = low"
     "  D       Days until deadline (negative = past)"
     "  Flags   (A)cked (O)wned (C)anceled/(R)esolved/(E)xpired"
@@ -1882,14 +1909,14 @@
                                       "--bind" "ctrl-n:down"
                                       "--bind" "ctrl-p:up"
                                       "--bind" (mark-bind "alt-*" "sticky")
-                                      "--bind" (mark-bind "alt-enter" "skip")
+                                      "--bind" (mark-bind "alt-enter" "dismiss")
                                       "--bind" (picker-bind "ctrl-s" "--internal-pick-sort")
                                       "--bind" (picker-bind "ctrl-r" "--internal-pick-types")
                                       "--bind" (picker-bind "ctrl-b" "--internal-pick-sources")
                                       "--bind" (picker-bind "ctrl-t" "--internal-pick-topics")
                                       "--bind" clear-bind]
                                cursor-pos (conj "--bind" (str "load:pos(" (inc cursor-pos) ")")))
-                  {:keys [exit out]}
+                  {:keys [out]}
                   (apply process/shell {:in input :out :string :continue true} fzf-args)
                   lines      (when (seq (str/trim out))
                                (str/split-lines (str/trim out)))
@@ -1998,12 +2025,14 @@
 
 (defn- section-recent [reports rcfg]
   (let [days     (:recent-days rcfg 7)
+        top-n    (:top-n rcfg 10)
         cutoff   (- (System/currentTimeMillis) (* days 86400000))
         recent   (->> reports
                       (filter #(> (parse-date-ms (:date-raw %)) cutoff))
-                      (sort-by #(parse-date-ms (:date-raw %)) >))]
+                      (sort-by #(parse-date-ms (:date-raw %)) >)
+                      (take top-n))]
     (when (seq recent)
-      (str (section-header (str "Recent (last " days " days)")) "\n"
+      (str (section-header (str "Recent (last " days " days, up to " top-n ")")) "\n"
            (str/join "\n" (map #(report-one-liner % :prefix (date-only (:date %))) recent))
            "\n"))))
 
@@ -2023,16 +2052,18 @@
            (str/join "\n" (map #(report-one-liner % :prefix (format "%3dd left" (::exp-days %))) expiring))
            "\n"))))
 
-(defn- section-owned [reports _rcfg addresses]
+(defn- section-owned [reports rcfg addresses]
   (when (seq addresses)
-    (let [addrs (if (set? addresses) addresses (normalize-addresses addresses))
+    (let [top-n (:top-n rcfg 10)
+          addrs (if (set? addresses) addresses (normalize-addresses addresses))
           owned (->> reports
                      (remove :closed)
                      (filter #(when-let [o (:owned %)]
                                 (contains? addrs (str/lower-case o))))
-                     (sort-by #(parse-date-ms (:date-raw %)) >))]
+                     (sort-by #(parse-date-ms (:date-raw %)) >)
+                     (take top-n))]
       (when (seq owned)
-        (str (section-header "Owned (your open reports)") "\n"
+        (str (section-header (str "Owned (your open reports, up to " top-n ")")) "\n"
              (str/join "\n" (map #(report-one-liner % :prefix (date-only (:date %))) owned))
            "\n")))))
 
@@ -2073,7 +2104,7 @@
    :mine          {:alias :m :coerce :boolean :desc "Show only your reports"}
    :skip-columns  {:alias :S :coerce :string :desc "Hide columns (comma-separated)" :ref "<COLS>"}
    :sticky        {:alias :T :coerce :boolean :desc "Show only items marked :sticky"}
-   :all           {:alias :A :coerce :boolean :desc "Show all items, including skipped"}
+   :all           {:alias :A :coerce :boolean :desc "Show all items, including dismissed"}
    :list-sources  {:alias :l :coerce :boolean :desc "List configured sources"}
    :add-source    {:alias :a :coerce :string :desc "Add a source" :ref "<URL>"}
    :remove-source {:alias :r :coerce :string :desc "Remove a source" :ref "<URL>"}
@@ -2097,7 +2128,7 @@
   (println)
   (println "Local marks (kept in ~/.config/gnaw/state.edn):")
   (println "  Alt-*  toggle :sticky (keep visible, column '*')")
-  (println "  Alt-Enter toggle :skip (hide; column '_', shown only with --all)")
+  (println "  Alt-Enter toggle dismiss (hide; column 'd', shown only with --all)")
   (println "  Ctrl-h inside fzf shows the full keymap."))
 
 (defn- parse-opts
@@ -2226,6 +2257,10 @@
     (catch clojure.lang.ExceptionInfo e
       (binding [*out* *err*]
         (println (str "gnaw: " (.getMessage e))))
+      (System/exit 1))
+    (catch Exception e
+      (binding [*out* *err*]
+        (println (str "gnaw: " (or (.getMessage e) (str e)))))
       (System/exit 1))))
 
 (when (= *file* (System/getProperty "babashka.file"))
