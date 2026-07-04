@@ -1494,7 +1494,7 @@
     "  Ctrl-v                     View attachment (patch, ics, txt)"
     "  Ctrl-/                     Show related reports"
     "  Ctrl-s                     Change sort order"
-    "  Ctrl-b / Ctrl-r / Ctrl-t   Filter by source / type / topic"
+    "  Ctrl-b / Ctrl-r / Ctrl-t   Filter by source / report type / topic"
     "  Ctrl-x                     Remove all filters"
     "  Ctrl-u                     Update cache and reload"
     "  Alt-*                      Toggle :sticky (keep visible, column '*')"
@@ -2110,7 +2110,26 @@
    :remove-source {:alias :r :coerce :string :desc "Remove a source" :ref "<URL>"}
    :test-config   {:alias :t :coerce :boolean :desc "Verify ~/.config/gnaw/config.edn"}
    :dry-run       {:coerce :boolean :desc "With `prune`: list orphan entries without removing them"}
+   :version       {:alias :v :coerce :boolean :desc "Show the gnaw version"}
    :help          {:alias :h :coerce :boolean :desc "Show this help"}})
+
+(defn- gnaw-version
+  "Best-effort version string, read from bbin's install metadata
+  (`bbin ls --edn`). Returns the git tag, or nil when bbin is absent or gnaw
+  was not installed through it (e.g. running from a source checkout)."
+  []
+  (try
+    (let [{:keys [out exit]} (process/shell {:out :string :err :string :continue true}
+                                            "bbin" "ls" "--edn")]
+      (when (zero? exit)
+        (some (fn [e]
+                (when (= 'io.github.bzg/gnaw (:lib e))
+                  (get-in e [:coords :git/tag])))
+              (vals (edn/read-string out)))))
+    (catch Exception _ nil)))
+
+(defn- print-version! []
+  (println (str "gnaw " (or (gnaw-version) "(version unknown)"))))
 
 (defn- usage []
   (println "Usage: gnaw [COMMAND] [OPTIONS]")
@@ -2228,6 +2247,7 @@
           [cmd opts] (parse-opts args)
           config     (delay (load-config))]
       (cond
+        (:version opts)        (print-version!)
         (:help opts)           (usage)
         (:test-config opts)    (when-not (test-config!) (System/exit 1))
         (= cmd "clear")        (clear-cache!)
