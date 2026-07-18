@@ -131,7 +131,10 @@
       (println "No sources configured. Use --add-source URL_OR_PATH to add one.")
       (doseq [{:keys [name repo] :as s} sources]
         (println (str "  " (or name "(unnamed)")
-                      (when repo (str "  (repo: " repo ")"))))
+                      (when repo
+                        (str "  (repo: "
+                             (str/join ", " (if (string? repo) [repo] repo))
+                             ")"))))
         (doseq [u (source-urls s)]
           (println (str "      " u)))))))
 
@@ -224,12 +227,13 @@
                         (err! (str ":sources[" i "] is missing :name"))
                         (not (string? (:name s)))
                         (err! (str ":sources[" i "] :name must be a string")))
-                      (when (and (contains? s :repo)
-                                 (not (string? (:repo s)))
-                                 (not (and (sequential? (:repo s)) (seq (:repo s))
-                                           (every? string? (:repo s)))))
-                        (err! (str ":sources[" i "] :repo must be a string"
-                                   " or a non-empty vector of strings"))))))
+                      (when (contains? s :repo)
+                        (let [r (:repo s)]
+                          (when-not (or (string? r)
+                                        (and (sequential? r) (seq r)
+                                             (every? string? r)))
+                            (err! (str ":sources[" i "] :repo must be a string"
+                                       " or a non-empty vector of strings"))))))))
                 ;; :name is the unique key identifying a source.
                 (doseq [[nm cnt] (->> v (filter map?) (keep :name) (filter string?) frequencies)
                         :when (> cnt 1)]
