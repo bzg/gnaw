@@ -224,8 +224,12 @@
                         (err! (str ":sources[" i "] is missing :name"))
                         (not (string? (:name s)))
                         (err! (str ":sources[" i "] :name must be a string")))
-                      (when (and (contains? s :repo) (not (string? (:repo s))))
-                        (err! (str ":sources[" i "] :repo must be a string"))))))
+                      (when (and (contains? s :repo)
+                                 (not (string? (:repo s)))
+                                 (not (and (sequential? (:repo s)) (seq (:repo s))
+                                           (every? string? (:repo s)))))
+                        (err! (str ":sources[" i "] :repo must be a string"
+                                   " or a non-empty vector of strings"))))))
                 ;; :name is the unique key identifying a source.
                 (doseq [[nm cnt] (->> v (filter map?) (keep :name) (filter string?) frequencies)
                         :when (> cnt 1)]
