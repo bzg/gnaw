@@ -1220,6 +1220,14 @@
             text-browser-cmds)
       (platform-opener)))
 
+(defn- safe-cache-segment
+  "Force a remote-controlled name into a single path segment: path separators
+  become '_' and '.'/'..' are rejected, so a crafted :source cannot make
+  cache paths escape the cache directory."
+  [s]
+  (let [cleaned (str/replace (or s "") #"[/\\]" "_")]
+    (if (or (str/blank? cleaned) (#{"." ".."} cleaned)) "default" cleaned)))
+
 (defn- attachment-paths
   "Return a vector of {:url ... :cache-path ...} for attachments of a given kind.
   `kind` is the report key (:events or :texts), `subdir` the URL/cache subdirectory."
@@ -1228,7 +1236,7 @@
     (let [base       (or (:base-dir report)
                          (when-let [bp (:base-url report)]
                            (if (str/ends-with? bp "/") bp (str bp "/"))))
-          src-name   (or (:source report) "default")]
+          src-name   (safe-cache-segment (:source report))]
       (mapv (fn [a]
               (let [file       (:file a)
                     ;; Drop every ""/"."/".." path segment (not just a leading
