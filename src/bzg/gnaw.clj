@@ -767,7 +767,9 @@
          "  :END:\n")))
 
 (defn- render-org-state [state]
-  (let [entries (sort-by (fn [[_ v]] (or (:created v) "")) #(compare %2 %1) state)]
+  ;; Sort on parsed dates: :created holds whatever format the source used
+  ;; (RFC-2822, ISO, ...), so a lexical compare would interleave them.
+  (let [entries (sort-by (fn [[_ v]] (parse-date-ms (:created v))) #(compare %2 %1) state)]
     (str org-header
          (str/join "\n" (map (fn [[mid v]] (render-entry mid v)) entries)))))
 
