@@ -394,7 +394,7 @@
   [url]
   (let [u (str/replace url #"/+$" "")]
     (cond
-      (str/ends-with? u ".json")    url
+      (str/ends-with? u ".json")    u
       (str/ends-with? u "/reports") (str u "/all.json")
       :else                         (str u "/reports/all.json"))))
 
