@@ -496,7 +496,10 @@
   (let [urls (->> (str/split-lines (slurp path))
                   (map str/trim)
                   (remove #(or (str/blank? %) (str/starts-with? % "#"))))]
-    (merge-results (map load-from-url urls))))
+    ;; Same rationale as load-from-sources: listed URLs may overlap
+    ;; (e.g. all.json alongside all-open.json).
+    (update (merge-results (map load-from-url urls))
+            :reports dedup-by-message-id)))
 
 ;; --- Cache ---
 
