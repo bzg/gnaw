@@ -20,6 +20,7 @@
 ;;   gnaw.clj clear           Empty the cache
 ;;   gnaw.clj update          Fetch/update reports from all sources
 ;;   gnaw.clj report          Print a triage summary for maintainers
+;;   gnaw.clj todo            Export :sticky marks to ~/.config/gnaw/todo.org
 ;;   gnaw.clj prune           Drop state marks for reports no longer in any source
 ;;
 ;; Options:
@@ -28,15 +29,19 @@
 ;;   -U, --urls-file FILE     Fetch & merge reports from URLs listed in FILE
 ;;   -M, --my-addresses EMAILS Your email(s), comma-separated (overrides config)
 ;;   -p, --min-priority 1-3   Only show reports with priority >= N
-;;   -s, --min-score 0-7     Only show reports with status score >= N
+;;   -s, --min-score 0-7      Only show reports with status score >= N
 ;;   -n, --source NAME        Filter by source name
 ;;   -S, --skip-columns COLS  Columns to hide, comma-separated
 ;;   -m, --mine               Show only reports involving your address(es)
+;;   -T, --sticky             Show only reports marked :sticky
+;;   -A, --all                Show all reports, including dismissed ones
 ;;   -a, --add-source PATH    Add a source; a tracker base URL prompts which
 ;;                            report files to add (reads reports/meta.json)
 ;;   -r, --remove-source PATH Remove a reports.json source
 ;;   -l, --list-sources       List configured sources
 ;;   -t, --test-config        Verify ~/.config/gnaw/config.edn
+;;   -v, --version            Show the gnaw version
+;;       --dry-run            With `prune`: list orphans without removing them
 ;;   -h, --help               Show help
 ;;   -                        Read JSON from stdin
 ;;
@@ -1111,7 +1116,7 @@
 (defn- report-columns
   "Return a vector of column values for a report.
   skip is a set of column names to hide (e.g. #{\"owner\" \"att\"}).
-  user-state is the loaded state.edn map; nil means no mark column."
+  user-state is the loaded state.edn map (nil renders a blank mark)."
   [report show-type? show-src? skip user-state]
   (let [skip (normalize-skip-columns skip)]
     (concat
@@ -1165,7 +1170,7 @@
       line)))
 
 ;; ---------------------------------------------------------------------------
-;; Display
+;; Display helpers (alignment, browsers, pagers, attachments)
 ;; ---------------------------------------------------------------------------
 
 (defn- fzf-available? []
@@ -1311,7 +1316,7 @@
 ;; Sorting
 ;; ---------------------------------------------------------------------------
 
-(def sort-options
+(def ^:private sort-options
   ;; Each entry: [label key-fn cmp ?needs-state]. key-fn takes [report state],
   ;; but only the entry tagged needs-state pays the cost of loading state.edn.
   [["date (newest)"    (fn [r _] (- (parse-date-ms (:date-raw r))))                              compare]
@@ -1829,7 +1834,7 @@
 (def ^:private gnaw-script-path
   (or (System/getProperty "babashka.file") *file*))
 
-(defn display-reports!
+(defn- display-reports!
   "Display reports interactively with fzf, or as plain text lines.
   reload-fn, when non-nil, is called on ctrl-u to refresh the cache and
   return a new {:reports ...} map.
