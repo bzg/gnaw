@@ -1570,14 +1570,14 @@
 
 (def ^:private fetch-helper-block
   ;; Lazy fetch helper: gnaw_fetch URL CACHE_PATH
+  ;; $1 = url, $2 = dest; positional params avoid the non-POSIX `local`.
   (str/join "\n"
             ["gnaw_fetch() {"
-             "  local url=\"$1\" dest=\"$2\""
-             "  if [ ! -f \"$dest\" ]; then"
-             "    mkdir -p \"$(dirname \"$dest\")\""
-             "    case \"$url\" in"
-             "      http://*|https://*) curl -sfLo \"$dest\" \"$url\" || wget -qO \"$dest\" \"$url\" ;;"
-             "      *) cp \"$url\" \"$dest\" ;;"
+             "  if [ ! -f \"$2\" ]; then"
+             "    mkdir -p \"$(dirname \"$2\")\""
+             "    case \"$1\" in"
+             "      http://*|https://*) curl -sfLo \"$2\" \"$1\" || wget -qO \"$2\" \"$1\" ;;"
+             "      *) cp \"$1\" \"$2\" ;;"
              "    esac"
              "  fi"
              "}"
