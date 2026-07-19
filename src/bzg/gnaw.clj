@@ -1157,11 +1157,12 @@
     (zero? (:exit (process/shell {:out :string :err :string :continue true} "fzf" "--version")))
     (catch Exception _ false)))
 
-(defn- tmp-path
-  "Build /tmp/gnaw-<tag>-<ts><ext> for a temp file. Pass a single shared
-  timestamp when several related files must be cleaned up together."
-  [tag ts ext]
-  (str (System/getProperty "java.io.tmpdir") "/gnaw-" tag "-" ts ext))
+(defn- make-temp-dir!
+  "Create a private (0700) temp directory for this invocation's helper files
+  (dispatch script, session, help text). Predictable names in a shared /tmp
+  would let another local user pre-create or symlink a path gnaw executes."
+  []
+  (str (fs/create-temp-dir {:prefix "gnaw-" :posix-file-permissions "rwx------"})))
 
 (defn- align-columns
   "Pure-Clojure column alignment, a fallback for when `column` is unavailable.
@@ -1775,11 +1776,11 @@
               rows          (mapv #(report->row % show-type? show-src? skip user-state) resolved)
               aligned       (tabulate (cons header rows))
               input         (str/join "\n" aligned)
-              ts            (System/currentTimeMillis)
-              dispatch-path (tmp-path "related"      ts ".sh")
-              help-path     (tmp-path "related-help" ts ".txt")]
-          (spit help-path usage-text)
+              tmp-dir       (make-temp-dir!)
+              dispatch-path (str tmp-dir "/dispatch.sh")
+              help-path     (str tmp-dir "/help.txt")]
           (try
+            (spit help-path usage-text)
             (write-dispatch-script! dispatch-path help-path config resolved)
             (apply process/shell {:in input :out :string :continue true}
                    ["fzf" "--ansi" "--header-lines" "1"
@@ -1796,8 +1797,7 @@
                     "--bind" "esc:abort"])
             true
             (finally
-              (.delete (io/file dispatch-path))
-              (.delete (io/file help-path)))))))))
+              (fs/delete-tree tmp-dir))))))))
 
 
 (defn- handle-ctrl-u!
@@ -1832,10 +1832,10 @@
         show-src?    (multiple-sources? reports)
         skip-columns (normalize-skip-columns (or skip-columns (:skip-columns config)))
         view-mode    (or view-mode :default)
-        ts            (System/currentTimeMillis)
-        dispatch-path (tmp-path "dispatch" ts ".sh")
-        session-path  (tmp-path "session"  ts ".json")
-        help-path     (tmp-path "help"     ts ".txt")
+        tmp-dir       (make-temp-dir!)
+        dispatch-path (str tmp-dir "/dispatch.sh")
+        session-path  (str tmp-dir "/session.json")
+        help-path     (str tmp-dir "/help.txt")
         bb-gnaw       (str "bb " (shell-escape gnaw-script-path) " ")
         sess          (shell-escape session-path)
         print-list    (str bb-gnaw "--internal-print " sess)
@@ -1855,129 +1855,128 @@
                         (str key ":execute-silent(" bb-gnaw sub " " sess ")" refresh))
         clear-bind    (str "ctrl-x:execute-silent(" bb-gnaw "--internal-clear-filters "
                            sess ")" refresh)]
-    (if (empty? reports)
-      (println "No reports found.")
-      (if (fzf-available?)
-        (try
-          ;; Build initial session, write the help text once.
-          (spit help-path usage-text)
-          (let [filtered    (startup-filter reports (load-state) view-mode)
-                all-types   (vec (distinct (map (comp display-type :type) filtered)))
-                all-sources (vec (distinct (keep :source filtered)))
-                all-topics  (vec (distinct (keep :topic filtered)))
-                sorted      (sort-reports filtered 0)]
-            (write-session! session-path
-                            {:reports      sorted
-                             :sort-idx     0
-                             :types        nil :sources nil :topics nil
-                             :all-types    all-types
-                             :all-sources  all-sources
-                             :all-topics   all-topics
-                             :show-type?   show-type?
-                             :show-src?    show-src?
-                             :skip-columns skip-columns
-                             :view-mode    view-mode}))
-          ;; Cache `visible`, `aligned`, `mid-index`, and the on-disk dispatch
-          ;; script across loop iterations, keyed on the mtimes of the two
-          ;; mutable files: session.json (touched by sort/filter pickers) and
-          ;; state.edn (touched by mark toggles). Ctrl-/ touches neither, so
-          ;; coming back from the related view reuses everything.
-          (loop [cursor-pos nil
-                 cached     nil]
-            (let [mtimes     [(.lastModified (io/file session-path))
-                              (.lastModified (io/file state-edn-path))]
-                  ctx        (if (and cached (= mtimes (:mtimes cached)))
-                               cached
-                               (let [user-state (load-state)
-                                     session    (read-session session-path)
-                                     visible    (session-visible session user-state)
-                                     skip       (normalize-skip-columns (:skip-columns session))
-                                     header     (column-headers show-type? show-src? skip)
-                                     rows       (mapv #(report->row % show-type? show-src? skip user-state) visible)
-                                     aligned    (tabulate (cons header rows))
-                                     ;; Append a hidden, tab-delimited visible
-                                     ;; index to every data row (not the
-                                     ;; header). fzf hides it via --with-nth 1
-                                     ;; but returns the full line on selection,
-                                     ;; so we read the index back unambiguously
-                                     ;; even when two rows render identically.
-                                     ;; `tabulate` strips all tabs, so the
-                                     ;; appended one is the only separator.
-                                     input      (str/join "\n"
-                                                          (cons (first aligned)
-                                                                (map-indexed (fn [i row] (str row "\t" i))
-                                                                             (rest aligned))))
-                                     mid-index  (into {} (keep (fn [r]
-                                                                 (when-let [m (:message-id r)]
-                                                                   [m r])))
-                                                      (:reports session))]
-                                 (write-dispatch-script! dispatch-path help-path config visible)
-                                 {:mtimes     mtimes
-                                  :user-state user-state
-                                  :session    session
-                                  :visible    visible
-                                  :input      input
-                                  :mid-index  mid-index}))
-                  {:keys [user-state session visible input mid-index]} ctx
-                  fzf-args   (cond-> ["fzf" "--ansi" "--header-lines" "1"
-                                      "--delimiter" "\t" "--with-nth" "1" "--nth" "1"
-                                      "--header" (status-header
-                                                  (:sort-idx session 0) session
-                                                  (:all-types session)
-                                                  (:all-sources session)
-                                                  (:all-topics session))
-                                      "--no-sort" "--reverse" "--no-hscroll"
-                                      "--prompt" "report> "
-                                      "--expect" expect-keys
-                                      "--bind" (str "enter:" exec-action "(" dispatch-path " open {n})")
-                                      "--bind" (str "ctrl-o:execute-silent(" dispatch-path " browse {n})")
-                                      "--bind" (str "ctrl-v:" exec-action "(" dispatch-path " view {n})")
-                                      "--bind" (str "ctrl-h:" exec-action "(" dispatch-path " help)")
-                                      "--bind" "ctrl-n:down"
-                                      "--bind" "ctrl-p:up"
-                                      "--bind" (mark-bind "alt-*" "sticky")
-                                      "--bind" (mark-bind "alt-enter" "dismiss")
-                                      "--bind" (picker-bind "ctrl-s" "--internal-pick-sort")
-                                      "--bind" (picker-bind "ctrl-r" "--internal-pick-types")
-                                      "--bind" (picker-bind "ctrl-b" "--internal-pick-sources")
-                                      "--bind" (picker-bind "ctrl-t" "--internal-pick-topics")
-                                      "--bind" clear-bind]
-                               cursor-pos (conj "--bind" (str "load:pos(" (inc cursor-pos) ")")))
-                  {:keys [out]}
-                  (apply process/shell {:in input :out :string :continue true} fzf-args)
-                  lines      (when (seq (str/trim out))
-                               (str/split-lines (str/trim out)))
-                  key-used   (first lines)
-                  selected   (second lines)
-                  sel-idx    (when selected
-                               (when-let [t (str/last-index-of selected "\t")]
-                                 (parse-long (subs selected (inc t)))))
-                  sel-report (when sel-idx (nth visible sel-idx nil))]
-              (case key-used
-                "ctrl-/"
-                (do (when (and sel-report (seq (:related sel-report)))
-                      ;; Silent no-op when none of the related ids resolve in
-                      ;; the loaded data: avoids a one-shot println that
-                      ;; flashes between fzf alt-screens.
-                      (show-related! sel-report mid-index config
-                                     show-type? show-src? skip-columns user-state))
-                    (recur sel-idx ctx))
-                "ctrl-u"
-                (do (handle-ctrl-u! reload-fn session-path)
-                    (recur nil nil))
-                nil)))
-          (finally
-            (.delete (io/file dispatch-path))
-            (.delete (io/file session-path))
-            (.delete (io/file help-path))))
-        ;; Plain text fallback
-        (let [user-state (load-state)
-              visible    (->> (startup-filter reports user-state view-mode)
-                              (remove :closed)
-                              (filter #(visible-by-state? user-state % view-mode)))]
-          (println (count visible) "report(s):\n")
-          (doseq [r visible]
-            (println " " (report->line r show-type? show-src? skip-columns user-state))))))))
+    (try
+      (if (empty? reports)
+        (println "No reports found.")
+        (if (fzf-available?)
+          (do
+            ;; Build initial session, write the help text once.
+            (spit help-path usage-text)
+            (let [filtered    (startup-filter reports (load-state) view-mode)
+                  all-types   (vec (distinct (map (comp display-type :type) filtered)))
+                  all-sources (vec (distinct (keep :source filtered)))
+                  all-topics  (vec (distinct (keep :topic filtered)))
+                  sorted      (sort-reports filtered 0)]
+              (write-session! session-path
+                              {:reports      sorted
+                               :sort-idx     0
+                               :types        nil :sources nil :topics nil
+                               :all-types    all-types
+                               :all-sources  all-sources
+                               :all-topics   all-topics
+                               :show-type?   show-type?
+                               :show-src?    show-src?
+                               :skip-columns skip-columns
+                               :view-mode    view-mode}))
+            ;; Cache `visible`, `aligned`, `mid-index`, and the on-disk dispatch
+            ;; script across loop iterations, keyed on the mtimes of the two
+            ;; mutable files: session.json (touched by sort/filter pickers) and
+            ;; state.edn (touched by mark toggles). Ctrl-/ touches neither, so
+            ;; coming back from the related view reuses everything.
+            (loop [cursor-pos nil
+                   cached     nil]
+              (let [mtimes     [(.lastModified (io/file session-path))
+                                (.lastModified (io/file state-edn-path))]
+                    ctx        (if (and cached (= mtimes (:mtimes cached)))
+                                 cached
+                                 (let [user-state (load-state)
+                                       session    (read-session session-path)
+                                       visible    (session-visible session user-state)
+                                       skip       (normalize-skip-columns (:skip-columns session))
+                                       header     (column-headers show-type? show-src? skip)
+                                       rows       (mapv #(report->row % show-type? show-src? skip user-state) visible)
+                                       aligned    (tabulate (cons header rows))
+                                       ;; Append a hidden, tab-delimited visible
+                                       ;; index to every data row (not the
+                                       ;; header). fzf hides it via --with-nth 1
+                                       ;; but returns the full line on selection,
+                                       ;; so we read the index back unambiguously
+                                       ;; even when two rows render identically.
+                                       ;; `tabulate` strips all tabs, so the
+                                       ;; appended one is the only separator.
+                                       input      (str/join "\n"
+                                                            (cons (first aligned)
+                                                                  (map-indexed (fn [i row] (str row "\t" i))
+                                                                               (rest aligned))))
+                                       mid-index  (into {} (keep (fn [r]
+                                                                   (when-let [m (:message-id r)]
+                                                                     [m r])))
+                                                        (:reports session))]
+                                   (write-dispatch-script! dispatch-path help-path config visible)
+                                   {:mtimes     mtimes
+                                    :user-state user-state
+                                    :session    session
+                                    :visible    visible
+                                    :input      input
+                                    :mid-index  mid-index}))
+                    {:keys [user-state session visible input mid-index]} ctx
+                    fzf-args   (cond-> ["fzf" "--ansi" "--header-lines" "1"
+                                        "--delimiter" "\t" "--with-nth" "1" "--nth" "1"
+                                        "--header" (status-header
+                                                    (:sort-idx session 0) session
+                                                    (:all-types session)
+                                                    (:all-sources session)
+                                                    (:all-topics session))
+                                        "--no-sort" "--reverse" "--no-hscroll"
+                                        "--prompt" "report> "
+                                        "--expect" expect-keys
+                                        "--bind" (str "enter:" exec-action "(" dispatch-path " open {n})")
+                                        "--bind" (str "ctrl-o:execute-silent(" dispatch-path " browse {n})")
+                                        "--bind" (str "ctrl-v:" exec-action "(" dispatch-path " view {n})")
+                                        "--bind" (str "ctrl-h:" exec-action "(" dispatch-path " help)")
+                                        "--bind" "ctrl-n:down"
+                                        "--bind" "ctrl-p:up"
+                                        "--bind" (mark-bind "alt-*" "sticky")
+                                        "--bind" (mark-bind "alt-enter" "dismiss")
+                                        "--bind" (picker-bind "ctrl-s" "--internal-pick-sort")
+                                        "--bind" (picker-bind "ctrl-r" "--internal-pick-types")
+                                        "--bind" (picker-bind "ctrl-b" "--internal-pick-sources")
+                                        "--bind" (picker-bind "ctrl-t" "--internal-pick-topics")
+                                        "--bind" clear-bind]
+                                 cursor-pos (conj "--bind" (str "load:pos(" (inc cursor-pos) ")")))
+                    {:keys [out]}
+                    (apply process/shell {:in input :out :string :continue true} fzf-args)
+                    lines      (when (seq (str/trim out))
+                                 (str/split-lines (str/trim out)))
+                    key-used   (first lines)
+                    selected   (second lines)
+                    sel-idx    (when selected
+                                 (when-let [t (str/last-index-of selected "\t")]
+                                   (parse-long (subs selected (inc t)))))
+                    sel-report (when sel-idx (nth visible sel-idx nil))]
+                (case key-used
+                  "ctrl-/"
+                  (do (when (and sel-report (seq (:related sel-report)))
+                        ;; Silent no-op when none of the related ids resolve in
+                        ;; the loaded data: avoids a one-shot println that
+                        ;; flashes between fzf alt-screens.
+                        (show-related! sel-report mid-index config
+                                       show-type? show-src? skip-columns user-state))
+                      (recur sel-idx ctx))
+                  "ctrl-u"
+                  (do (handle-ctrl-u! reload-fn session-path)
+                      (recur nil nil))
+                  nil))))
+          ;; Plain text fallback
+          (let [user-state (load-state)
+                visible    (->> (startup-filter reports user-state view-mode)
+                                (remove :closed)
+                                (filter #(visible-by-state? user-state % view-mode)))]
+            (println (count visible) "report(s):\n")
+            (doseq [r visible]
+              (println " " (report->line r show-type? show-src? skip-columns user-state))))))
+      (finally
+        (fs/delete-tree tmp-dir)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Report (triage summary)
