@@ -1644,8 +1644,9 @@
                            :item item
                            :diff? diff?})
                 entry-labels (mapv :label entries)]
-            (str "    PICK=$(printf "
-                 (shell-escape (str/join "\\n" entry-labels))
+            ;; '%s\n' as the printf format keeps '%' and '\' in labels literal.
+            (str "    PICK=$(printf '%s\\n' "
+                 (str/join " " (map shell-escape entry-labels))
                  " | fzf --prompt 'view> ' --no-sort --reverse)\n"
                  "    [ -z \"$PICK\" ] && exit 0\n"
                  "    case \"$PICK\" in\n"
