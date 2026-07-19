@@ -606,7 +606,7 @@
 
 (defn- iso-now [] (str (java.time.Instant/now)))
 
-(defn- parse-to-zdt
+(defn- parse-to-zdt*
   "Parse a date/time string of various formats to java.time.ZonedDateTime.
   Supports RFC-1123/2822, ISO-8601, and simple YYYY-MM-DD formats.
   Returns nil on failure."
@@ -652,6 +652,20 @@
        (try (-> (java.time.LocalDate/parse s)
                 (.atStartOfDay java.time.ZoneOffset/UTC))
             (catch Exception _ nil))))))
+
+(def ^:private parse-to-zdt
+  "Memoized parse-to-zdt*: the format cascade is costly and the same date
+  strings recur across reports, renders and sorts."
+  (memoize parse-to-zdt*))
+
+(defn- parse-date-ms
+  "Parse a date-raw string to epoch millis for sorting. Returns 0 on failure."
+  [s]
+  (if-let [zdt (parse-to-zdt s)]
+    (try
+      (.toEpochMilli (.toInstant zdt))
+      (catch Exception _ 0))
+    0))
 
 (defn- format-org-timestamp
   "Format an ISO-8601 or 'YYYY-MM-DD HH:MM' string as an Org inactive
@@ -1294,15 +1308,6 @@
 ;; ---------------------------------------------------------------------------
 ;; Sorting
 ;; ---------------------------------------------------------------------------
-
-(defn- parse-date-ms
-  "Parse a date-raw string to epoch millis for sorting. Returns 0 on failure."
-  [s]
-  (if-let [zdt (parse-to-zdt s)]
-    (try
-      (.toEpochMilli (.toInstant zdt))
-      (catch Exception _ 0))
-    0))
 
 (def sort-options
   ;; Each entry: [label key-fn cmp ?needs-state]. key-fn takes [report state],
@@ -2223,11 +2228,12 @@
   the related-view can resolve cross-references; the main fzf list hides
   them at render time via `session-visible`."
   [reports {:keys [source mine my-addresses min-priority min-score]}]
-  (cond->> reports
-    source                     (filter #(= (:source %) source))
-    (and mine my-addresses)    (filter #(involves-email? % my-addresses))
-    min-priority               (filter #(>= (:priority % 0) min-priority))
-    min-score                  (filter #(>= (:score (report-flags+score %)) min-score))))
+  (let [addrs (normalize-addresses my-addresses)]
+    (cond->> reports
+      source                  (filter #(= (:source %) source))
+      (and mine (seq addrs))  (filter #(involves-email? % addrs))
+      min-priority            (filter #(>= (:priority % 0) min-priority))
+      min-score               (filter #(>= (:score (report-flags+score %)) min-score)))))
 
 (defn- coerce-addresses
   "Coerce a :my-addresses value into a vector of address strings, or nil.
