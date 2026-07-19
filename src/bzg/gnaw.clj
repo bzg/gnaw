@@ -1273,6 +1273,13 @@
   "Pagers that read from stdin rather than a file argument."
   #{"delta" "diff-so-fancy"})
 
+(defn- pager-from-env
+  "Command vector from $PAGER, split on whitespace so values with arguments
+  (e.g. \"less -FRX\") work. Falls back to [\"less\"]."
+  []
+  (let [p (System/getenv "PAGER")]
+    (if (str/blank? p) ["less"] (str/split (str/trim p) #"\s+"))))
+
 (defn- patch-pager
   "Return a command vector for viewing patches with syntax highlighting.
   Honors :diff-pager from config, then probes delta/bat, falls back to $PAGER/less."
@@ -1281,7 +1288,7 @@
         (some (fn [[cmd v]] (when (= cmd p) v)) diff-pager-cmds))
       (some (fn [[cmd v]] (when (and (not= cmd "diff-so-fancy") (command-available? cmd)) v))
             diff-pager-cmds)
-      [(or (System/getenv "PAGER") "less")]))
+      (pager-from-env)))
 
 ;; ---------------------------------------------------------------------------
 ;; Sorting
@@ -1619,7 +1626,7 @@
             ;; LESS env covers the case where $PAGER is something other
             ;; than less; explicit args win when it IS less.
             (fn [path] (str (when tmux? "LESS='-R +g' ")
-                            (shell-escape plain-pager) " " path))
+                            (str/join " " (map shell-escape plain-pager)) " " path))
             emit-fetch-and-page
             (fn [{:keys [url cache-path]} diff?]
               (str "    gnaw_fetch " (shell-escape url) " " (shell-escape cache-path) "\n"
@@ -1686,7 +1693,7 @@
         pager       (patch-pager config)
         stdin?      (stdin-diff-pagers (first pager))
         dsf?        (= "diff-so-fancy" (first pager))
-        plain-pager (or (System/getenv "PAGER") "less")
+        plain-pager (pager-from-env)
         hf          (shell-escape help-path)
         self        (shell-escape dispatch-path)
         ;; help fits this many lines (text + a couple for the less prompt).
