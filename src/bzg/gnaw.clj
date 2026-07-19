@@ -2178,14 +2178,16 @@
   (println "  Ctrl-h inside fzf shows the full keymap."))
 
 (defn- parse-opts
-  "Parse CLI options from an argument sequence. Returns [cmd opts]."
+  "Parse CLI options from an argument sequence. Returns [cmd opts].
+  The subcommand is taken from the positional arguments only, so an option
+  value that happens to match a command name (e.g. `-f update`) is left
+  alone."
   [args]
   (let [stdin?  (some #{"-"} args)
         args    (remove #{"-"} args)
         subcmds #{"clear" "update" "report" "todo" "prune"}
+        {:keys [args opts]} (cli/parse-args (vec args) {:spec cli-spec})
         cmd     (first (filter subcmds args))
-        args    (remove subcmds args)
-        opts    (cli/parse-opts args {:spec cli-spec})
         opts    (cond
                   stdin?          (assoc opts :data-src :stdin)
                   (:file opts)    (assoc opts :data-src :file)
